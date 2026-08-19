@@ -52,3 +52,13 @@ config and auth files. It has its own `unifyCodexSessionHistory` setting; when
 enabled, it performs the same provider relabeling (database plus rollout
 `session_meta`) with its own backups. Prefer that built-in path when CC Switch
 is installed, and use `scripts/sync_provider.py` as a standalone fallback.
+
+## Windows notes
+
+- Codex data lives under `%USERPROFILE%\.codex` by default (`state_5.sqlite`,
+  `sqlite\codex-dev.db`, `sessions`, `archived_sessions`), matching the layout
+  the sync script expects.
+- `pathlib` normalizes Windows paths, and the scripts use only Python standard
+  library APIs, so no macOS-specific code is required.
+- `enable_ccswitch_unify.py` checks `~/.cc-switch/settings.json` and the
+  `%APPDATA%` locations used by Windows builds of CC Switch.

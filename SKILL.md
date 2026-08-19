@@ -26,6 +26,26 @@ skill relabels provider metadata and keeps baseline backups.
 5. If the sidebar still does not refresh, ask the user to restart Codex or
    toggle the sidebar view. Do not touch `archived` state or delete files.
 
+## Windows
+
+The same workflow works on Windows because Codex Desktop uses the same
+provider filtering and local file layout there. Install by cloning
+`https://github.com/aiden23333/codex-history-unify` and copying the folder to
+`%USERPROFILE%\.codex\skills\codex-history-unify` (or
+`%CODEX_HOME%\skills\codex-history-unify` when CODEX_HOME is set).
+
+Python 3.11 or newer is required for the built-in `tomllib` parser. Run the
+scripts with `python` instead of `python3`:
+
+```powershell
+python scripts\sync_provider.py --dry-run
+python scripts\sync_provider.py --apply
+```
+
+`scripts/enable_ccswitch_unify.py` searches both `~/.cc-switch/settings.json`
+and the `%APPDATA%` locations used by Windows builds of CC Switch. If the file
+lives somewhere else, pass it explicitly with `--settings`.
+
 ## Rollback
 
 Restore the oldest baseline backup with:

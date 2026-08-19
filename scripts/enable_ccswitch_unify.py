@@ -25,9 +25,13 @@ def main() -> int:
     parser.add_argument("--settings", type=Path, help="Path to CC Switch settings.json")
     args = parser.parse_args()
 
-    path = args.settings or Path.home() / ".cc-switch" / "settings.json"
+    path = args.settings or find_settings_path()
     if not path.exists():
-        print(f"CC Switch settings not found: {path}", file=sys.stderr)
+        print(
+            "CC Switch settings not found. Open CC Switch settings and enable "
+            "the unified Codex session history toggle, or pass --settings.",
+            file=sys.stderr,
+        )
         return 1
 
     with path.open("r", encoding="utf-8") as fh:
@@ -54,6 +58,20 @@ def main() -> int:
     print("Enabled unifyCodexSessionHistory in", path)
     print("If CC Switch is running, restart it or switch providers once to run the migration.")
     return 0
+
+
+def find_settings_path() -> Path:
+    home = Path.home()
+    candidates = [home / ".cc-switch" / "settings.json"]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        root = Path(appdata)
+        candidates.append(root / "cc-switch" / "settings.json")
+        candidates.append(root / "CC Switch" / "settings.json")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 if __name__ == "__main__":

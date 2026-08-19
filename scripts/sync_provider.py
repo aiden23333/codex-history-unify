@@ -48,7 +48,7 @@ def current_provider(home: Path) -> str:
 
 
 def connect_ro(path: Path):
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    return sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
 
 
 def read_rollout_provider(path: Path):
