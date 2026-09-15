@@ -57,6 +57,9 @@ What the guard does on every detected switch:
 - Re-checks on every trigger instead of trusting the last successful switch, so
   damage written later under the same provider is still repaired once Codex
   closes.
+- Repairs rollout files that no writer holds even while Codex keeps running, so
+  closing one broken window is enough: the guard retries as soon as that window
+  releases its writer lock, without restarting the app.
 - Retries a repair that another process blocks with backoff (20 s up to 300 s)
   instead of looping or reporting success it did not achieve; a repair blocked
   while Codex runs is retried as soon as the app closes.
