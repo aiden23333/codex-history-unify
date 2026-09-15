@@ -355,6 +355,12 @@ _MTIME_WATCHED = ("config.toml", "cc-switch-model-catalog.json", "settings.json"
 _SIZE_WATCHED = ("cc-switch.db", "cc-switch.db-wal", "cc-switch.db-shm")
 
 
+def _stamp() -> str:
+    """Local timestamp so a log entry can be placed on a real timeline."""
+
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _watch_signature(codex_home: Path, cc_home: Path) -> tuple:
     values = []
     for name in _MTIME_WATCHED:
@@ -398,6 +404,10 @@ def run_forever(
     pending_delay: float | None = None
     app_running: bool | None = None
     app_polled_at = 0.0
+    print(
+        f"{_stamp()} guard_started pid={os.getpid()} poll={poll_seconds}s",
+        flush=True,
+    )
     retries = (0.5, 1.0, 2.0, 4.0)
     while True:
         current = _watch_signature(guard.codex_home, guard.cc_home)
@@ -421,7 +431,7 @@ def run_forever(
                     if type(exc).__name__ != logged_error:
                         logged_error = type(exc).__name__
                         print(
-                            f"guard_error={type(exc).__name__}: {exc}",
+                            f"{_stamp()} guard_error={type(exc).__name__}: {exc}",
                             file=sys.stderr,
                             flush=True,
                         )
@@ -433,7 +443,8 @@ def run_forever(
                     else ""
                 )
                 print(
-                    f"action={decision.action} fingerprint={decision.fingerprint[:12]}{detail}",
+                    f"{_stamp()} action={decision.action}"
+                    f" fingerprint={decision.fingerprint[:12]}{detail}",
                     flush=True,
                 )
                 if decision.action.startswith("deferred") and not app_running:

@@ -7,6 +7,7 @@ from scripts.codex_switch_guard import (
     CodexProcessProbe,
     Guard,
     _parse_elapsed,
+    _stamp,
     run_forever,
 )
 from scripts.codex_switch_preflight import ReconcileReport, TargetSnapshot
@@ -307,6 +308,9 @@ class ElapsedParseTest(unittest.TestCase):
         probe = CodexProcessProbe(Path.home() / ".codex")
         uptime = probe.codex_app_uptime_seconds()
         self.assertTrue(uptime is None or uptime >= 0)
+
+    def test_log_timestamp_is_sortable(self) -> None:
+        self.assertRegex(_stamp(), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
 
 if __name__ == "__main__":
