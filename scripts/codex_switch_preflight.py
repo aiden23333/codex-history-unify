@@ -54,6 +54,7 @@ class ReconcileReport:
     backup_dir: Path | None = None
     deferred: int = 0
     busy: bool = False
+    unreadable: int = 0
 
 
 def _sessions_busy(sessions: Path, window: float) -> bool:
@@ -250,11 +251,12 @@ def reconcile(
     apply: bool,
 ) -> ReconcileReport:
     sessions = codex_home / "sessions"
-    planned_protocol = migrate_protocol.plan(
+    protocol_plan = migrate_protocol.plan(
         sessions,
         codex_home / "thread-writer-locks",
         snapshot.target,
     )
+    planned_protocol = protocol_plan.changes
     protocol_changes = [change for change in planned_protocol if change.writable]
     deferred_changes = [change for change in planned_protocol if not change.writable]
     provider_changes = sync_provider.plan_provider_sync(
@@ -277,6 +279,7 @@ def reconcile(
         catalog_changed=catalog_changed,
         deferred=len(deferred_changes),
         busy=_sessions_busy(sessions, ACTIVE_WRITE_WINDOW_SECONDS),
+        unreadable=len(protocol_plan.unreadable),
     )
     if not apply or not changed:
         return report
@@ -336,6 +339,7 @@ def main() -> int:
     print(f"cc_switch_changed={int(report.cc_switch_changed)}")
     print(f"catalog_changed={int(report.catalog_changed)}")
     print(f"deferred={report.deferred}")
+    print(f"unreadable={report.unreadable}")
     if report.deferred:
         print(
             "warning=rollout_files_owned_by_another_process",

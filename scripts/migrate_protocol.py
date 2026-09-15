@@ -28,6 +28,7 @@ class Change:
     reasoning_items: int
     locked: bool = False
     truncated: bool = False
+    structural: bool = False
 
     @property
     def writable(self) -> bool:
@@ -112,33 +113,115 @@ def _parse_line(line: str, path: Path, number: int) -> dict:
         raise ValueError(f"invalid JSONL: {path}:{number}: {exc}") from exc
 
 
+def _escape_raw_controls(text: str) -> tuple[str, bool]:
+    """Escape control characters that appear inside JSON strings.
+
+    Codex rollouts are appended as one JSON object per line, but a row written
+    from a multi-line tool output can end up with raw newlines inside a string.
+    Such a row spans several physical lines and makes both a line-based reader
+    and a strict JSON reader fail, even though the content is recoverable.
+    """
+
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    changed = False
+    for char in text:
+        if not in_string:
+            out.append(char)
+            if char == '"':
+                in_string = True
+            continue
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            out.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            out.append(char)
+            in_string = False
+            continue
+        if ord(char) < 0x20:
+            out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(char, f"\\u{ord(char):04x}"))
+            changed = True
+            continue
+        out.append(char)
+    return "".join(out), changed
+
+
+def _decode_stream(text: str) -> list[dict]:
+    """Decode concatenated JSON values, allowing rows to span physical lines."""
+
+    decoder = json.JSONDecoder()
+    rows: list[dict] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index] in " \t\r\n":
+            index += 1
+        if index >= length:
+            break
+        value, index = decoder.raw_decode(text, index)
+        if not isinstance(value, dict):
+            raise ValueError("rollout row is not a JSON object")
+        rows.append(value)
+    return rows
+
+
+@dataclass
+class RolloutRead:
+    rows: list[dict]
+    truncated: bool = False
+    structural: bool = False
+    unreadable: str | None = None
+
+
+def read_rollout(path: Path, tolerate_truncated_tail: bool = False) -> RolloutRead:
+    """Read one rollout, reporting truncation, structural damage or unreadability.
+
+    A partial final line (a live writer mid-append) is reported as `truncated`.
+    A file whose rows are not one-per-line is reported as `structural` so it can
+    be rewritten as canonical JSONL. Anything else is `unreadable` and is never
+    rewritten.
+    """
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.split("\n")
+    strict_rows: list[dict] = []
+    truncated = False
+    strict_ok = True
+    for number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            strict_rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            if tolerate_truncated_tail and number == len(lines):
+                truncated = True
+                continue
+            strict_ok = False
+            break
+    if strict_ok:
+        return RolloutRead(rows=strict_rows, truncated=truncated)
+
+    escaped, changed = _escape_raw_controls(text)
+    try:
+        rows = _decode_stream(escaped)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return RolloutRead(rows=[], unreadable=f"{type(exc).__name__}: {exc}")
+    if not rows:
+        return RolloutRead(rows=[], unreadable="no decodable rows")
+    return RolloutRead(rows=rows, structural=changed)
+
+
 def read_jsonl_rows(
     path: Path, tolerate_truncated_tail: bool = False
 ) -> tuple[list[dict], bool]:
-    """Parse a rollout, optionally ignoring one unterminated final line.
-
-    A rollout that a live writer is still appending to can end with a partial
-    line. The partial row is unusable, but a reader only needs the remaining
-    rows to decide whether the file needs repair; such files are never written
-    in the same pass.
-    """
-
-    rows: list[dict] = []
-    truncated = False
-    pending: tuple[int, str] | None = None
-    with path.open("r", encoding="utf-8") as fh:
-        for number, line in enumerate(fh, 1):
-            if pending is not None:
-                rows.append(_parse_line(pending[1], path, pending[0]))
-            pending = (number, line)
-    if pending is not None and pending[1].strip():
-        try:
-            rows.append(_parse_line(pending[1], path, pending[0]))
-        except ValueError:
-            if not tolerate_truncated_tail:
-                raise
-            truncated = True
-    return rows, truncated
+    read = read_rollout(path, tolerate_truncated_tail)
+    return read.rows, read.truncated
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -165,29 +248,50 @@ def writer_in_use(path: Path, lock_dir: Path, lsof_bin: Path | None = None) -> b
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
+@dataclass
+class PlanResult:
+    changes: list[Change]
+    unreadable: list[tuple[Path, str]]
+
+
 def plan(
     sessions_dir: Path,
     lock_dir: Path,
     target: str = "gpt",
     lsof_bin: Path | None = None,
-) -> list[Change]:
+) -> PlanResult:
     """Plan repairs for every rollout, marking entries that must not be written.
 
     Files a live writer holds, and files with an unparsable final line, are
     reported with `locked`/`truncated` set so a caller can decide whether the
-    app has to be restarted before the repair can be applied.
+    app has to be restarted before the repair can be applied. Files whose rows
+    are not one-per-line are reported as `structural` because rewriting them as
+    canonical JSONL is itself the repair. Files that cannot be decoded at all
+    are listed separately so one damaged conversation never blocks the rest.
     """
 
     changes: list[Change] = []
+    unreadable: list[tuple[Path, str]] = []
     for path in sorted(sessions_dir.rglob("*.jsonl")):
         locked = writer_in_use(path, lock_dir, lsof_bin)
-        rows, truncated = read_jsonl_rows(path, tolerate_truncated_tail=locked)
-        migrated, ids, reasoning = transform(rows, target)
-        if ids or reasoning:
+        read = read_rollout(path, tolerate_truncated_tail=locked)
+        if read.unreadable:
+            unreadable.append((path, read.unreadable))
+            continue
+        migrated, ids, reasoning = transform(read.rows, target)
+        if ids or reasoning or read.structural:
             changes.append(
-                Change(path, migrated, ids, reasoning, locked=locked, truncated=truncated)
+                Change(
+                    path,
+                    migrated,
+                    ids,
+                    reasoning,
+                    locked=locked,
+                    truncated=read.truncated,
+                    structural=read.structural,
+                )
             )
-    return changes
+    return PlanResult(changes=changes, unreadable=unreadable)
 
 
 def scan(
@@ -197,8 +301,8 @@ def scan(
     lsof_bin: Path | None = None,
 ) -> tuple[list[Change], int]:
     planned = plan(sessions_dir, lock_dir, target, lsof_bin)
-    writable = [change for change in planned if change.writable]
-    return writable, len(planned) - len(writable)
+    writable = [change for change in planned.changes if change.writable]
+    return writable, len(planned.changes) - len(writable)
 
 
 def create_backup(changes: list[Change], sessions_dir: Path, backup_root: Path) -> Path:
@@ -266,12 +370,18 @@ def main() -> int:
     if args.restore_latest:
         return restore_latest(args.sessions_dir, args.backup_root)
     target = detect_target(home) if args.target == "auto" else args.target
-    changes, skipped = scan(args.sessions_dir, args.lock_dir, target, args.lsof_bin)
+    planned = plan(args.sessions_dir, args.lock_dir, target, args.lsof_bin)
+    changes = [change for change in planned.changes if change.writable]
+    skipped = len(planned.changes) - len(changes)
     print(f"target={target}")
     print(f"files_to_change={len(changes)}")
     print(f"assistant_ids={sum(c.assistant_ids for c in changes)}")
     print(f"reasoning_items={sum(c.reasoning_items for c in changes)}")
     print(f"locked_files_skipped={skipped}")
+    print(f"structural_repairs={sum(1 for c in changes if c.structural)}")
+    print(f"unreadable_files={len(planned.unreadable)}")
+    for path, reason in planned.unreadable[:5]:
+        print(f"warning=unreadable_rollout:{path.name}:{reason}", file=sys.stderr)
     if not args.apply:
         print("dry_run=true")
         return 0

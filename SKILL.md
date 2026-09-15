@@ -29,6 +29,44 @@ rewriting visible messages or valid GPT encrypted reasoning.
 5. If the sidebar still does not refresh, ask the user to restart Codex or
    toggle the sidebar view. Do not touch `archived` state or delete files.
 
+## Automatic mode (macOS LaunchAgent)
+
+The skill ships a background guard so a provider switch needs no manual step:
+close Codex, switch in CC Switch, open Codex once, and every local unarchived
+task works on that first launch.
+
+```bash
+python3 scripts/codex_switch_preflight.py --dry-run   # inspect one reconciliation
+python3 scripts/codex_switch_guard.py --plan-only     # inspect the guard decision, read-only
+python3 scripts/install_switch_guard.py --dry-run     # show what would be installed
+python3 scripts/install_switch_guard.py --apply       # install the LaunchAgent
+python3 scripts/install_switch_guard.py --uninstall   # remove it again
+```
+
+Installing writes `~/Library/LaunchAgents/com.aiden.codex-switch-guard.plist`
+(mode 600) and boots label `com.aiden.codex-switch-guard` into `gui/<uid>`.
+Guard state and logs stay in `~/.codex/switch-guard/`; no credentials, tokens,
+or response bodies are ever written there.
+
+What the guard does on every detected switch:
+
+- Watches `config.toml`, CC Switch `settings.json`, the CC Switch database, and
+  the generated model catalog, then waits until they stop changing.
+- Repairs assistant response IDs, unreplayable reasoning items, provider labels,
+  the DeepSeek provider card (native Responses), and the DeepSeek catalog
+  `text`/`image` modalities.
+- Restarts Codex at most once per switch, and only when the app was launched
+  within the last three minutes and no task is mid-turn. A long-running session
+  is never interrupted; pending repairs are applied the next time Codex closes.
+- Skips rollouts a live writer holds and never touches archived conversations.
+- Retries a blocked repair with backoff (20 s up to 300 s) instead of looping or
+  reporting success it did not achieve.
+
+Keep the DeepSeek provider card on native Responses. A Chat Completions
+upstream converts Codex `function_call` history into paired chat messages and
+has already produced orphan tool messages on this machine, so the guard always
+restores `apiFormat = "openai_responses"`.
+
 ## Protocol migration after a model switch
 
 When a visible conversation fails after switching providers:

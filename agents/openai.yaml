@@ -1,7 +1,7 @@
 interface:
   display_name: "Codex 会话历史统一"
-  short_description: "在 DeepSeek 与 Codex 账号间切换后，统一恢复本地会话到侧边栏"
-  default_prompt: "Use $codex-history-unify to refresh local conversations after switching Codex accounts."
+  short_description: "切换 DeepSeek 与 GPT 后自动修复并恢复本地会话，无需手动操作"
+  default_prompt: "Use $codex-history-unify to install the automatic switch guard or repair conversations after switching Codex providers."
 
 policy:
   allow_implicit_invocation: true

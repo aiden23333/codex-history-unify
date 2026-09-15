@@ -116,10 +116,22 @@ def active_locks(home: Path) -> set[str]:
 
 
 def compute_changes(rows: list[dict], target: str, home: Path) -> list[dict]:
+    """List visible threads that still need relabelling for the target provider.
+
+    Archived conversations are never relabelled automatically, and a thread
+    whose rollout file is gone can never match the target provider, so both are
+    left out. Without those exclusions the plan would never converge.
+    """
+
     locks = active_locks(home)
     changes = []
     for row in rows:
-        if row["db_provider"] != target or row["rollout_provider"] != target:
+        if row["archived"]:
+            continue
+        rollout = Path(row["rollout_path"]) if row["rollout_path"] else None
+        rollout_present = rollout is not None and rollout.exists()
+        rollout_mismatch = rollout_present and row["rollout_provider"] != target
+        if row["db_provider"] != target or rollout_mismatch:
             item = dict(row)
             item["skipped"] = item["thread_id"] in locks
             changes.append(item)

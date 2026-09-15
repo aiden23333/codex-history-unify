@@ -44,6 +44,7 @@ class AppController(Protocol):
 class GuardDecision:
     action: str
     fingerprint: str
+    unreadable: int = 0
 
 
 class CodexProcessProbe:
@@ -282,11 +283,12 @@ class Guard:
         planned = self.reconciler(
             snapshot, self.codex_home, self.cc_home, apply=False
         )
+        unreadable = int(getattr(planned, "unreadable", 0) or 0)
         if not planned.changed:
             state["last_successful_fingerprint"] = snapshot.fingerprint
             state.pop("last_error", None)
             self._save_state(state)
-            return GuardDecision("noop", snapshot.fingerprint)
+            return GuardDecision("noop", snapshot.fingerprint, unreadable)
 
         restarted = False
         if self.process_probe.codex_app_running():
@@ -297,7 +299,7 @@ class Guard:
                 state["last_error"] = "deferred_app_running"
                 state["pending_fingerprint"] = snapshot.fingerprint
                 self._save_state(state)
-                return GuardDecision("deferred", snapshot.fingerprint)
+                return GuardDecision("deferred", snapshot.fingerprint, unreadable)
             if state.get("restart_attempted_fingerprint") == snapshot.fingerprint:
                 raise RuntimeError("automatic restart already attempted for this switch")
             state["restart_attempted_fingerprint"] = snapshot.fingerprint
@@ -328,8 +330,10 @@ class Guard:
             self._save_state(state)
             if restarted:
                 self.app_controller.open_codex()
-                return GuardDecision("deferred_after_restart", snapshot.fingerprint)
-            return GuardDecision("deferred", snapshot.fingerprint)
+                return GuardDecision(
+                    "deferred_after_restart", snapshot.fingerprint, unreadable
+                )
+            return GuardDecision("deferred", snapshot.fingerprint, unreadable)
 
         state["last_successful_fingerprint"] = snapshot.fingerprint
         state.pop("last_error", None)
@@ -338,8 +342,10 @@ class Guard:
         self._save_state(state)
         if restarted:
             self.app_controller.open_codex()
-            return GuardDecision("restarted_after_reconcile", snapshot.fingerprint)
-        return GuardDecision("reconciled", snapshot.fingerprint)
+            return GuardDecision(
+                "restarted_after_reconcile", snapshot.fingerprint, unreadable
+            )
+        return GuardDecision("reconciled", snapshot.fingerprint, unreadable)
 
 
 # CC Switch checkpoints its database continuously, which bumps the file mtime
@@ -419,8 +425,13 @@ def run_forever(
                         )
                     break
                 logged_error = None
+                detail = (
+                    f" unreadable={decision.unreadable}"
+                    if decision.unreadable
+                    else ""
+                )
                 print(
-                    f"action={decision.action} fingerprint={decision.fingerprint[:12]}",
+                    f"action={decision.action} fingerprint={decision.fingerprint[:12]}{detail}",
                     flush=True,
                 )
                 if decision.action.startswith("deferred"):
@@ -463,6 +474,7 @@ def main() -> int:
         print(f"provider_threads={planned.provider_threads}")
         print(f"cc_switch_changed={int(planned.cc_switch_changed)}")
         print(f"catalog_changed={int(planned.catalog_changed)}")
+        print(f"unreadable={planned.unreadable}")
         return 0
     if args.once:
         decision = guard.run_once()

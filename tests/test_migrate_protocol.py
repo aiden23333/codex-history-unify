@@ -167,10 +167,11 @@ class ProtocolPlanTest(unittest.TestCase):
 
         self._lock_marker()
         lsof = self._fake_lsof("echo 4242\nexit 0")
-        changes = migrate_protocol.plan(self.sessions, self.locks, "gpt", lsof)
-        self.assertEqual(len(changes), 1)
-        self.assertTrue(changes[0].locked)
-        self.assertFalse(changes[0].truncated)
+        planned = migrate_protocol.plan(self.sessions, self.locks, "gpt", lsof)
+        self.assertEqual(len(planned.changes), 1)
+        self.assertTrue(planned.changes[0].locked)
+        self.assertFalse(planned.changes[0].truncated)
+        self.assertEqual(planned.unreadable, [])
         self.assertEqual(read_jsonl(self.rollout)[0]["payload"]["id"], "resp_abc_msg")
 
     def test_scan_keeps_skipping_locked_rollouts(self) -> None:
@@ -182,6 +183,36 @@ class ProtocolPlanTest(unittest.TestCase):
         self.assertEqual(changes, [])
         self.assertEqual(skipped, 1)
 
+    def test_plan_recovers_rows_split_across_physical_lines(self) -> None:
+        from scripts import migrate_protocol
+
+        row = {"type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "msg_ok", "content": [{"type": "output_text", "text": "line one\nline two"}]}}
+        raw = json.dumps(row, ensure_ascii=False)
+        broken = raw.replace("line one\\nline two", "line one\nline two")
+        self.rollout.write_text(broken + "\n", encoding="utf-8")
+
+        planned = migrate_protocol.plan(self.sessions, self.locks, "gpt")
+        self.assertEqual(len(planned.changes), 1)
+        change = planned.changes[0]
+        self.assertTrue(change.structural)
+        self.assertEqual(planned.unreadable, [])
+
+        migrate_protocol.write_rows(change.path, change.rows)
+        reread = read_jsonl(change.path)
+        self.assertEqual(len(reread), 1)
+        self.assertEqual(reread[0]["payload"]["content"][0]["text"], "line one\nline two")
+
+    def test_plan_reports_unreadable_rollout_without_blocking_others(self) -> None:
+        from scripts import migrate_protocol
+
+        damaged = self.sessions / "2026" / "09" / "15" / "rollout-2026-09-15T00-00-01-33333333-3333-3333-3333-333333333333.jsonl"
+        damaged.write_text('{"type": "response_item", "payload": {\n', encoding="utf-8")
+
+        planned = migrate_protocol.plan(self.sessions, self.locks, "gpt")
+        self.assertEqual(len(planned.changes), 1)
+        self.assertEqual(len(planned.unreadable), 1)
+        self.assertEqual(planned.unreadable[0][0], damaged)
+
     def test_plan_marks_truncated_tail_as_not_writable(self) -> None:
         from scripts import migrate_protocol
 
@@ -189,6 +220,6 @@ class ProtocolPlanTest(unittest.TestCase):
         lsof = self._fake_lsof("echo 4242\nexit 0")
         with self.rollout.open("a", encoding="utf-8") as fh:
             fh.write('{"type": "response_item", "payload": {"type": "mess')
-        changes = migrate_protocol.plan(self.sessions, self.locks, "gpt", lsof)
-        self.assertEqual(len(changes), 1)
-        self.assertTrue(changes[0].truncated)
+        planned = migrate_protocol.plan(self.sessions, self.locks, "gpt", lsof)
+        self.assertEqual(len(planned.changes), 1)
+        self.assertTrue(planned.changes[0].truncated)

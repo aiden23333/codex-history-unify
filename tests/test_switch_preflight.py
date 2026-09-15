@@ -110,6 +110,19 @@ class SwitchPreflightTest(unittest.TestCase):
         self.assertEqual(len([row for row in rows if row.get("type") == "response_item" and row["payload"].get("type") == "reasoning"]), 2)
         self.assertTrue(report.changed)
 
+    def test_unreadable_rollout_is_reported_without_blocking_repairs(self) -> None:
+        damaged = self.codex_home / "sessions" / "2026" / "09" / "15" / "rollout-2026-09-15T00-00-01-33333333-3333-3333-3333-333333333333.jsonl"
+        damaged.write_text('{"type": "response_item", "payload": {\n', encoding="utf-8")
+        self.write_state(model="gpt-5.6-sol", current_provider="codex-official", api_format="openai_responses", proxy_enabled=False)
+        snapshot = preflight.read_stable_snapshot(self.codex_home, self.cc_home, stable_delay=0)
+        report = preflight.reconcile(snapshot, self.codex_home, self.cc_home, apply=True)
+        self.assertTrue(report.changed)
+        self.assertEqual(report.unreadable, 1)
+        rows = [json.loads(line) for line in self.rollout.read_text().splitlines()]
+        reasoning = [row["payload"]["id"] for row in rows if row.get("type") == "response_item" and row["payload"].get("type") == "reasoning"]
+        self.assertEqual(reasoning, ["rs_valid"])
+        self.assertEqual(damaged.read_text(), '{"type": "response_item", "payload": {\n')
+
     def test_gpt_reconcile_removes_plaintext_reasoning_and_is_idempotent(self) -> None:
         self.write_state(model="gpt-5.6-sol", current_provider="codex-official", api_format="openai_responses", proxy_enabled=False)
         snapshot = preflight.read_stable_snapshot(self.codex_home, self.cc_home, stable_delay=0)
