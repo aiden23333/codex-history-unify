@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -60,7 +61,7 @@ def is_incompatible_reasoning(payload: dict) -> bool:
     )
 
 
-def transform(rows: list[dict]) -> tuple[list[dict], int, int]:
+def transform(rows: list[dict], target: str = "gpt") -> tuple[list[dict], int, int]:
     output: list[dict] = []
     assistant_ids = 0
     reasoning_items = 0
@@ -71,7 +72,12 @@ def transform(rows: list[dict]) -> tuple[list[dict], int, int]:
         if not isinstance(payload, dict):
             output.append(row)
             continue
-        if row.get("type") == "response_item" and payload.get("type") == "reasoning" and is_incompatible_reasoning(payload):
+        if (
+            target == "gpt"
+            and row.get("type") == "response_item"
+            and payload.get("type") == "reasoning"
+            and is_incompatible_reasoning(payload)
+        ):
             reasoning_items += 1
             continue
         if row.get("type") == "response_item" and payload.get("type") == "message" and payload.get("role") == "assistant":
@@ -105,20 +111,39 @@ def read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-def writer_locked(path: Path, lock_dir: Path) -> bool:
+def writer_in_use(path: Path, lock_dir: Path, lsof_bin: Path | None = None) -> bool:
     match = THREAD_ID_RE.search(path.name)
-    return bool(match and (lock_dir / f"{match.group(1)}.lock").exists())
+    if not match:
+        return False
+    lock = lock_dir / f"{match.group(1)}.lock"
+    if not lock.exists():
+        return False
+    binary = lsof_bin or Path("/usr/sbin/lsof")
+    if not binary.exists():
+        return True
+    result = subprocess.run(
+        [str(binary), "-t", str(path), str(lock)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
-def scan(sessions_dir: Path, lock_dir: Path) -> tuple[list[Change], int]:
+def scan(
+    sessions_dir: Path,
+    lock_dir: Path,
+    target: str = "gpt",
+    lsof_bin: Path | None = None,
+) -> tuple[list[Change], int]:
     changes: list[Change] = []
     skipped = 0
     for path in sorted(sessions_dir.rglob("*.jsonl")):
-        if writer_locked(path, lock_dir):
+        if writer_in_use(path, lock_dir, lsof_bin):
             skipped += 1
             continue
         rows = read_jsonl(path)
-        migrated, ids, reasoning = transform(rows)
+        migrated, ids, reasoning = transform(rows, target)
         if ids or reasoning:
             changes.append(Change(path, migrated, ids, reasoning))
     return changes, skipped
@@ -181,17 +206,15 @@ def main() -> int:
     parser.add_argument("--restore-latest", action="store_true")
     parser.add_argument("--sessions-dir", type=Path, default=home / "sessions")
     parser.add_argument("--backup-root", type=Path, default=home / "skill-backups" / "unify-codex-history" / "protocol")
+    parser.add_argument("--lock-dir", type=Path, default=home / "thread-writer-locks")
+    parser.add_argument("--lsof-bin", type=Path)
     parser.add_argument("--keep", type=int, default=3)
     args = parser.parse_args()
 
     if args.restore_latest:
         return restore_latest(args.sessions_dir, args.backup_root)
     target = detect_target(home) if args.target == "auto" else args.target
-    if target == "deepseek":
-        print("diagnostic_only: GPT-to-DeepSeek conversion is error-specific; no files changed")
-        return 2 if args.apply else 0
-
-    changes, skipped = scan(args.sessions_dir, home / "thread-writer-locks")
+    changes, skipped = scan(args.sessions_dir, args.lock_dir, target, args.lsof_bin)
     print(f"target={target}")
     print(f"files_to_change={len(changes)}")
     print(f"assistant_ids={sum(c.assistant_ids for c in changes)}")
@@ -207,7 +230,7 @@ def main() -> int:
     archive = create_backup(changes, args.sessions_dir, args.backup_root)
     for change in changes:
         write_rows(change.path, change.rows)
-    remaining, _ = scan(args.sessions_dir, home / "thread-writer-locks")
+    remaining, _ = scan(args.sessions_dir, args.lock_dir, target, args.lsof_bin)
     if remaining:
         print(f"verification_failed={len(remaining)}", file=sys.stderr)
         return 1

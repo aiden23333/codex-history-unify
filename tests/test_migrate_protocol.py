@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -25,7 +26,8 @@ class ProtocolMigrationTest(unittest.TestCase):
         root = Path(self.temp.name)
         self.sessions = root / "sessions"
         self.backups = root / "backups"
-        self.rollout = self.sessions / "2026" / "09" / "15" / "rollout-test.jsonl"
+        self.locks = root / "locks"
+        self.rollout = self.sessions / "2026" / "09" / "15" / "rollout-2026-09-15T00-00-00-11111111-1111-1111-1111-111111111111.jsonl"
         self.original = [
             {"type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "resp_abc_msg", "content": [{"type": "output_text", "text": "answer"}]}},
             {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "AgentMessage", "id": "resp_abc_msg"}}},
@@ -41,7 +43,17 @@ class ProtocolMigrationTest(unittest.TestCase):
 
     def run_script(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "--sessions-dir", str(self.sessions), "--backup-root", str(self.backups), *args],
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--sessions-dir",
+                str(self.sessions),
+                "--backup-root",
+                str(self.backups),
+                "--lock-dir",
+                str(self.locks),
+                *args,
+            ],
             text=True,
             capture_output=True,
             check=False,
@@ -68,16 +80,54 @@ class ProtocolMigrationTest(unittest.TestCase):
         archives = list(self.backups.glob("*.tar.gz"))
         self.assertEqual(len(archives), 1)
         with tarfile.open(archives[0], "r:gz") as archive:
-            self.assertIn("2026/09/15/rollout-test.jsonl", archive.getnames())
+            self.assertIn(self.rollout.relative_to(self.sessions).as_posix(), archive.getnames())
 
         restored = self.run_script("--restore-latest")
         self.assertEqual(restored.returncode, 0, restored.stderr)
         self.assertEqual(read_jsonl(self.rollout), self.original)
 
-    def test_deepseek_target_only_diagnoses(self) -> None:
+    def test_deepseek_normalizes_ids_but_preserves_reasoning(self) -> None:
         result = self.run_script("--target", "deepseek", "--apply")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("diagnostic_only", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = read_jsonl(self.rollout)
+        self.assertEqual(rows[0]["payload"]["id"], "msg_abc")
+        self.assertEqual(rows[1]["payload"]["item"]["id"], "msg_abc")
+        reasoning = [
+            row
+            for row in rows
+            if row.get("type") == "response_item"
+            and row["payload"].get("type") == "reasoning"
+        ]
+        self.assertEqual(len(reasoning), 3)
+
+    def test_stale_lock_marker_does_not_skip(self) -> None:
+        self.locks.mkdir(parents=True)
+        (self.locks / "11111111-1111-1111-1111-111111111111.lock").touch()
+        lsof = Path(self.temp.name) / "lsof-stale"
+        lsof.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        os.chmod(lsof, 0o700)
+
+        result = self.run_script(
+            "--target", "gpt", "--apply", "--lsof-bin", str(lsof)
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("locked_files_skipped=0", result.stdout)
+        self.assertEqual(read_jsonl(self.rollout)[0]["payload"]["id"], "msg_abc")
+
+    def test_open_descriptor_skips_rollout(self) -> None:
+        self.locks.mkdir(parents=True)
+        (self.locks / "11111111-1111-1111-1111-111111111111.lock").touch()
+        lsof = Path(self.temp.name) / "lsof-active"
+        lsof.write_text("#!/bin/sh\necho 4242\nexit 0\n", encoding="utf-8")
+        os.chmod(lsof, 0o700)
+
+        result = self.run_script(
+            "--target", "gpt", "--apply", "--lsof-bin", str(lsof)
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("locked_files_skipped=1", result.stdout)
         self.assertEqual(read_jsonl(self.rollout), self.original)
 
 
