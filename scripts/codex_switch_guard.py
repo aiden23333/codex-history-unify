@@ -382,6 +382,7 @@ def run_forever(
     poll_seconds: float = 0.5,
     pending_poll_seconds: float = 20.0,
     max_pending_poll_seconds: float = 300.0,
+    app_poll_seconds: float = 2.0,
 ) -> None:
     """Watch for switch-state changes and finish deferred repairs off-peak.
 
@@ -397,7 +398,6 @@ def run_forever(
     pending_delay: float | None = None
     app_running: bool | None = None
     app_polled_at = 0.0
-    app_poll_seconds = 2.0
     retries = (0.5, 1.0, 2.0, 4.0)
     while True:
         current = _watch_signature(guard.codex_home, guard.cc_home)

@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.codex_switch_guard import CodexProcessProbe, Guard, _parse_elapsed
+from scripts.codex_switch_guard import (
+    CodexProcessProbe,
+    Guard,
+    _parse_elapsed,
+    run_forever,
+)
 from scripts.codex_switch_preflight import ReconcileReport, TargetSnapshot
 
 
@@ -249,6 +254,44 @@ class SwitchGuardTest(unittest.TestCase):
             guard.run_once()
         self.assertEqual(apps.quit_calls, 1)
         self.assertEqual(apps.open_calls, 1)
+
+
+class ForeverLoopTest(unittest.TestCase):
+    def test_closing_codex_triggers_reconciliation(self) -> None:
+        calls: list[str] = []
+
+        class Probe:
+            def __init__(self) -> None:
+                self.running = True
+                self.polls = 0
+
+            def codex_app_running(self) -> bool:
+                self.polls += 1
+                if self.polls > 1:
+                    self.running = False
+                return self.running
+
+        class FakeGuard:
+            codex_home = Path("/tmp/codex-home")
+            cc_home = Path("/tmp/cc-home")
+            process_probe = Probe()
+
+            @staticmethod
+            def run_once():
+                calls.append("run")
+                if len(calls) > 1:
+                    raise KeyboardInterrupt
+                return type("D", (), {"action": "noop", "fingerprint": "f" * 8, "unreadable": 0})()
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_forever(
+                FakeGuard(),
+                poll_seconds=0.01,
+                pending_poll_seconds=0.01,
+                max_pending_poll_seconds=0.02,
+                app_poll_seconds=0.01,
+            )
+        self.assertEqual(len(calls), 2)
 
 
 class ElapsedParseTest(unittest.TestCase):
