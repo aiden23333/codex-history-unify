@@ -58,6 +58,8 @@ class SwitchGuardTest(unittest.TestCase):
             "gpt", "codex-official", "gpt-5.6-sol", "openai", "openai_responses", "fingerprint-1"
         )
         self.apply_calls: list[bool] = []
+        self.repaired = {"done": False}
+        self.damage = {"active": False}
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -80,7 +82,13 @@ class SwitchGuardTest(unittest.TestCase):
             self.apply_calls.append(apply)
             if report is not None:
                 return report
-            return ReconcileReport(changed=changed if not apply else True)
+            if apply:
+                self.repaired["done"] = True
+                return ReconcileReport(changed=True)
+            # Mirrors the real reconciler: once repairs are applied the next
+            # plan reports nothing left to do.
+            pending = changed or self.damage["active"]
+            return ReconcileReport(changed=pending and not self.repaired["done"])
 
         guard = Guard(
             codex_home=self.root / "codex",
@@ -131,6 +139,18 @@ class SwitchGuardTest(unittest.TestCase):
         self.assertEqual(apps.quit_calls, 0)
         self.assertEqual(apps.open_calls, 0)
         self.assertEqual(self.apply_calls, [False])
+
+    def test_damage_that_appears_after_a_success_is_still_repaired(self) -> None:
+        """A later turn can write a broken item without changing the target."""
+
+        guard, apps = self.make_guard(opened=False, changed=False)
+        self.assertEqual(guard.run_once().action, "noop")
+        # The switch fingerprint is unchanged, but new damage now exists.
+        self.damage["active"] = True
+        decision = guard.run_once()
+        self.assertEqual(decision.action, "reconciled")
+        self.assertEqual(apps.quit_calls, 0)
+        self.assertEqual(self.apply_calls, [False, False, True])
 
     def test_long_running_session_is_never_interrupted(self) -> None:
         guard, apps = self.make_guard(opened=True)
@@ -184,8 +204,9 @@ class SwitchGuardTest(unittest.TestCase):
         self.assertNotIn("last_successful_fingerprint", state)
         self.assertEqual(state["last_error"], "deferred")
         self.assertEqual(state["restart_attempted_fingerprint"], "fingerprint-1")
-        with self.assertRaises(RuntimeError):
-            guard.run_once()
+        # The same switch never bounces twice; the repair waits for the close.
+        again = guard.run_once()
+        self.assertEqual(again.action, "deferred")
         self.assertEqual(apps.quit_calls, 1)
 
     def test_deferred_repairs_retry_while_codex_is_closed(self) -> None:
@@ -223,12 +244,14 @@ class SwitchGuardTest(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             guard.run_once()
-        with self.assertRaises(RuntimeError):
-            guard.run_once()
-        # A failed repair must not leave the app closed or restart it again.
+        self.assertEqual(self.state(guard)["last_error"], "RuntimeError")
+        # A failed repair must not leave the app closed, restart it again, or
+        # keep reporting an error for a switch that already used its one bounce.
+        again = guard.run_once()
+        self.assertEqual(again.action, "deferred")
         self.assertEqual(apps.quit_calls, 1)
         self.assertEqual(apps.open_calls, 1)
-        self.assertEqual(self.state(guard)["last_error"], "RuntimeError")
+        self.assertEqual(self.state(guard)["last_error"], "restart_already_attempted")
 
     def test_snapshot_failure_after_quit_reopens_codex(self) -> None:
         probe = FakeProbe(True)

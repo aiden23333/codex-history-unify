@@ -278,8 +278,9 @@ class Guard:
     def run_once(self) -> GuardDecision:
         snapshot = self._read_snapshot()
         state = self._load_state()
-        if state.get("last_successful_fingerprint") == snapshot.fingerprint:
-            return GuardDecision("noop", snapshot.fingerprint)
+        # The plan decides whether work is needed. A changed target is not the
+        # only trigger: a later turn can write a broken item while the selected
+        # provider stays the same, and that damage must still be repaired.
         planned = self.reconciler(
             snapshot, self.codex_home, self.cc_home, apply=False
         )
@@ -301,7 +302,12 @@ class Guard:
                 self._save_state(state)
                 return GuardDecision("deferred", snapshot.fingerprint, unreadable)
             if state.get("restart_attempted_fingerprint") == snapshot.fingerprint:
-                raise RuntimeError("automatic restart already attempted for this switch")
+                # One automatic bounce per switch. Anything still pending waits
+                # for the app to close instead of restarting again or erroring.
+                state["last_error"] = "restart_already_attempted"
+                state["pending_fingerprint"] = snapshot.fingerprint
+                self._save_state(state)
+                return GuardDecision("deferred", snapshot.fingerprint, unreadable)
             state["restart_attempted_fingerprint"] = snapshot.fingerprint
             self._save_state(state)
             self._close_codex()
