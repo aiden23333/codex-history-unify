@@ -265,10 +265,14 @@ def reconcile(
     apply_rollouts = scope in ("all", "rollouts")
     apply_config = scope == "all"
     sessions = codex_home / "sessions"
+    scan_cache = migrate_protocol.ScanCache(
+        codex_home / "switch-guard" / "scan-cache.json", snapshot.target
+    )
     protocol_plan = migrate_protocol.plan(
         sessions,
         codex_home / "thread-writer-locks",
         snapshot.target,
+        cache=scan_cache,
     )
     planned_protocol = protocol_plan.changes
     protocol_changes = [change for change in planned_protocol if change.writable]
@@ -299,6 +303,7 @@ def reconcile(
         ),
     )
     if not apply or not changed:
+        scan_cache.save()
         return report
 
     guarded_files = [cc_home / "settings.json", cc_database, catalog_path]
@@ -330,6 +335,7 @@ def reconcile(
             _validate_sqlite(path)
         if catalog_path.exists():
             json.loads(catalog_path.read_text(encoding="utf-8"))
+    scan_cache.save()
     return report
 
 

@@ -19,6 +19,9 @@ from pathlib import Path
 
 THREAD_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 
+# Bump whenever transform() changes, so cached clean verdicts are re-checked.
+SCAN_RULES_VERSION = 2
+
 # Item types the Responses API requires a call_id on in both directions.
 TOOL_ITEM_TYPES = (
     "function_call",
@@ -271,11 +274,90 @@ class PlanResult:
     unreadable: list[tuple[Path, str]]
 
 
+def _signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+class ScanCache:
+    """Remember rollouts already verified clean so a rescan stays cheap.
+
+    Reading every local rollout costs seconds of CPU per scan. A file that has
+    not changed since it was verified clean cannot need repair, so its recorded
+    signature lets the next scan skip it. Any append changes the size or mtime
+    and forces a fresh read. Skipping is never applied to a file a writer holds
+    or to one whose read was truncated.
+    """
+
+    def __init__(self, path: Path, target: str) -> None:
+        self.path = path
+        self.target = target
+        self.entries: dict[str, tuple[int, int]] = {}
+        self.dirty = False
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if (
+            data.get("target") != self.target
+            or data.get("rules") != SCAN_RULES_VERSION
+        ):
+            return
+        for key, value in (data.get("clean") or {}).items():
+            if isinstance(value, list) and len(value) == 2:
+                try:
+                    self.entries[key] = (int(value[0]), int(value[1]))
+                except (TypeError, ValueError):
+                    continue
+
+    def is_clean(self, path: Path, signature: tuple[int, int] | None) -> bool:
+        if signature is None:
+            return False
+        return self.entries.get(str(path)) == signature
+
+    def mark_clean(self, path: Path, signature: tuple[int, int] | None) -> None:
+        if signature is None:
+            return
+        if self.entries.get(str(path)) != signature:
+            self.entries[str(path)] = signature
+            self.dirty = True
+
+    def forget(self, path: Path) -> None:
+        if self.entries.pop(str(path), None) is not None:
+            self.dirty = True
+
+    def prune(self, seen: set[str]) -> None:
+        for key in [key for key in self.entries if key not in seen]:
+            del self.entries[key]
+            self.dirty = True
+
+    def save(self) -> None:
+        if not self.dirty:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "target": self.target,
+            "rules": SCAN_RULES_VERSION,
+            "clean": {key: list(value) for key, value in sorted(self.entries.items())},
+        }
+        temp = self.path.with_name(self.path.name + ".tmp")
+        temp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temp, self.path)
+        self.dirty = False
+
+
 def plan(
     sessions_dir: Path,
     lock_dir: Path,
     target: str = "gpt",
     lsof_bin: Path | None = None,
+    cache: ScanCache | None = None,
 ) -> PlanResult:
     """Plan repairs for every rollout, marking entries that must not be written.
 
@@ -289,14 +371,22 @@ def plan(
 
     changes: list[Change] = []
     unreadable: list[tuple[Path, str]] = []
+    seen: set[str] = set()
     for path in sorted(sessions_dir.rglob("*.jsonl")):
+        seen.add(str(path))
         locked = writer_in_use(path, lock_dir, lsof_bin)
+        if cache is not None and not locked and cache.is_clean(path, _signature(path)):
+            continue
         read = read_rollout(path, tolerate_truncated_tail=locked)
         if read.unreadable:
             unreadable.append((path, read.unreadable))
+            if cache is not None:
+                cache.forget(path)
             continue
         migrated, ids, reasoning, orphans = transform(read.rows, target)
         if ids or reasoning or orphans or read.structural:
+            if cache is not None:
+                cache.forget(path)
             changes.append(
                 Change(
                     path,
@@ -309,6 +399,10 @@ def plan(
                     orphan_tool_items=orphans,
                 )
             )
+        elif cache is not None and not locked and not read.truncated:
+            cache.mark_clean(path, _signature(path))
+    if cache is not None:
+        cache.prune(seen)
     return PlanResult(changes=changes, unreadable=unreadable)
 
 
@@ -317,8 +411,9 @@ def scan(
     lock_dir: Path,
     target: str = "gpt",
     lsof_bin: Path | None = None,
+    cache: ScanCache | None = None,
 ) -> tuple[list[Change], int]:
-    planned = plan(sessions_dir, lock_dir, target, lsof_bin)
+    planned = plan(sessions_dir, lock_dir, target, lsof_bin, cache=cache)
     writable = [change for change in planned.changes if change.writable]
     return writable, len(planned.changes) - len(writable)
 
@@ -382,13 +477,19 @@ def main() -> int:
     parser.add_argument("--backup-root", type=Path, default=home / "skill-backups" / "unify-codex-history" / "protocol")
     parser.add_argument("--lock-dir", type=Path, default=home / "thread-writer-locks")
     parser.add_argument("--lsof-bin", type=Path)
+    parser.add_argument(
+        "--scan-cache",
+        type=Path,
+        default=home / "switch-guard" / "scan-cache.json",
+    )
     parser.add_argument("--keep", type=int, default=3)
     args = parser.parse_args()
 
     if args.restore_latest:
         return restore_latest(args.sessions_dir, args.backup_root)
     target = detect_target(home) if args.target == "auto" else args.target
-    planned = plan(args.sessions_dir, args.lock_dir, target, args.lsof_bin)
+    cache = ScanCache(args.scan_cache, target)
+    planned = plan(args.sessions_dir, args.lock_dir, target, args.lsof_bin, cache=cache)
     changes = [change for change in planned.changes if change.writable]
     skipped = len(planned.changes) - len(changes)
     print(f"target={target}")
@@ -402,16 +503,19 @@ def main() -> int:
     for path, reason in planned.unreadable[:5]:
         print(f"warning=unreadable_rollout:{path.name}:{reason}", file=sys.stderr)
     if not args.apply:
+        cache.save()
         print("dry_run=true")
         return 0
     if not changes:
+        cache.save()
         print("changed=0")
         return 0
 
     archive = create_backup(changes, args.sessions_dir, args.backup_root)
     for change in changes:
         write_rows(change.path, change.rows)
-    remaining, _ = scan(args.sessions_dir, args.lock_dir, target, args.lsof_bin)
+    cache.save()
+    remaining, _ = scan(args.sessions_dir, args.lock_dir, target, args.lsof_bin, cache=cache)
     if remaining:
         print(f"verification_failed={len(remaining)}", file=sys.stderr)
         return 1

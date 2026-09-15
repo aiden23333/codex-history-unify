@@ -225,6 +225,78 @@ class ProtocolPlanTest(unittest.TestCase):
         self.assertTrue(planned.changes[0].truncated)
 
 
+class ScanCacheTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.sessions = root / "sessions"
+        self.locks = root / "locks"
+        self.cache_path = root / "scan-cache.json"
+        self.rollout = self.sessions / "2026" / "09" / "15" / "rollout-2026-09-15T00-00-00-11111111-1111-1111-1111-111111111111.jsonl"
+        write_jsonl(self.rollout, [{"type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "msg_ok", "content": []}}])
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_clean_rollout_is_skipped_once_cached(self) -> None:
+        from scripts import migrate_protocol
+
+        cache = migrate_protocol.ScanCache(self.cache_path, "deepseek")
+        first = migrate_protocol.plan(self.sessions, self.locks, "deepseek", cache=cache)
+        self.assertEqual(first.changes, [])
+        cache.save()
+        self.assertTrue(self.cache_path.exists())
+
+        # A second scan reuses the verdict; a rescan would still see a clean file.
+        reloaded = migrate_protocol.ScanCache(self.cache_path, "deepseek")
+        self.assertTrue(reloaded.is_clean(self.rollout, migrate_protocol._signature(self.rollout)))
+        second = migrate_protocol.plan(self.sessions, self.locks, "deepseek", cache=reloaded)
+        self.assertEqual(second.changes, [])
+
+    def test_appending_invalidates_the_cached_verdict(self) -> None:
+        from scripts import migrate_protocol
+
+        cache = migrate_protocol.ScanCache(self.cache_path, "deepseek")
+        migrate_protocol.plan(self.sessions, self.locks, "deepseek", cache=cache)
+        with self.rollout.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "response_item", "payload": {"type": "function_call_output", "id": "fco_1", "output": "x"}}) + "\n")
+        planned = migrate_protocol.plan(self.sessions, self.locks, "deepseek", cache=cache)
+        self.assertEqual(len(planned.changes), 1)
+        self.assertEqual(planned.changes[0].orphan_tool_items, 1)
+
+    def test_cache_for_another_target_is_ignored(self) -> None:
+        from scripts import migrate_protocol
+
+        cache = migrate_protocol.ScanCache(self.cache_path, "deepseek")
+        migrate_protocol.plan(self.sessions, self.locks, "deepseek", cache=cache)
+        cache.save()
+        other = migrate_protocol.ScanCache(self.cache_path, "gpt")
+        self.assertEqual(other.entries, {})
+
+    def test_stale_rules_version_is_ignored(self) -> None:
+        from scripts import migrate_protocol
+
+        cache = migrate_protocol.ScanCache(self.cache_path, "deepseek")
+        migrate_protocol.plan(self.sessions, self.locks, "deepseek", cache=cache)
+        cache.save()
+        data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        data["rules"] = migrate_protocol.SCAN_RULES_VERSION - 1
+        self.cache_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(migrate_protocol.ScanCache(self.cache_path, "deepseek").entries, {})
+
+    def test_locked_rollout_is_never_cached_as_clean(self) -> None:
+        from scripts import migrate_protocol
+
+        self.locks.mkdir(parents=True)
+        (self.locks / "11111111-1111-1111-1111-111111111111.lock").touch()
+        lsof = Path(self.temp.name) / "lsof-active"
+        lsof.write_text("#!/bin/sh\necho 4242\nexit 0\n", encoding="utf-8")
+        os.chmod(lsof, 0o700)
+        cache = migrate_protocol.ScanCache(self.cache_path, "deepseek")
+        migrate_protocol.plan(self.sessions, self.locks, "deepseek", lsof, cache=cache)
+        self.assertEqual(cache.entries, {})
+
+
 class OrphanToolItemTest(unittest.TestCase):
     """A tool-call item without call_id cannot be replayed by any provider."""
 

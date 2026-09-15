@@ -449,22 +449,25 @@ def run_forever(
     pending_poll_seconds: float = 20.0,
     max_pending_poll_seconds: float = 300.0,
     app_poll_seconds: float = 2.0,
+    lock_poll_seconds: float = 2.0,
 ) -> None:
     """Watch for switch-state changes and finish deferred repairs off-peak.
 
-    A repair blocked while Codex runs is retried when the app closes (the app
-    state transition is watched directly). A repair blocked by something else
-    (a rollout another process still holds) is retried with exponential backoff
-    instead of being abandoned, so the next launch is still healthy without the
-    user running anything by hand.
+    A repair Codex blocks is retried as soon as the blocking writer lets go of a
+    rollout. That check runs every couple of seconds because a window can be
+    closed and reopened within seconds; a repair blocked while the app is closed
+    is retried with exponential backoff instead.
     """
 
     previous = None
     logged_error = None
-    pending_delay: float | None = None
-    held_locks: int | None = None
+    pending = False
+    backoff = pending_poll_seconds
+    held_locks = 0
+    last_attempt = 0.0
     app_running: bool | None = None
     app_polled_at = 0.0
+    lock_polled_at = 0.0
     print(
         f"{_stamp()} guard_started pid={os.getpid()} poll={poll_seconds}s",
         flush=True,
@@ -473,25 +476,31 @@ def run_forever(
     while True:
         current = _watch_signature(guard.codex_home, guard.cc_home)
         now = time.monotonic()
+
         switched_app_state = False
         if app_running is None or now - app_polled_at >= app_poll_seconds:
             running = guard.process_probe.codex_app_running()
             app_polled_at = now
             switched_app_state = app_running is not None and running != app_running
             app_running = running
-        retry_ready = pending_delay is not None
-        if retry_ready and app_running:
-            # While Codex runs, a pending repair can only progress when a writer
-            # releases a rollout, so re-plan only when that set changes.
-            held_now = guard.process_probe.rollout_locks_held()
-            retry_ready = held_now != held_locks
-            held_locks = held_now
+
+        retry_ready = False
+        if pending:
+            if app_running:
+                if now - lock_polled_at >= lock_poll_seconds:
+                    lock_polled_at = now
+                    held_now = guard.process_probe.rollout_locks_held()
+                    retry_ready = held_now < held_locks
+                    held_locks = held_now
+            elif now - last_attempt >= backoff:
+                retry_ready = True
 
         if current != previous or switched_app_state or retry_ready:
             previous = current
             for retry_delay in (0.0, *retries):
                 if retry_delay:
                     time.sleep(retry_delay)
+                last_attempt = time.monotonic()
                 try:
                     decision = guard.run_once()
                 except Exception as exc:
@@ -517,19 +526,20 @@ def run_forever(
                     flush=True,
                 )
                 if decision.action.startswith("deferred"):
+                    pending = True
                     if app_running:
-                        # Waiting for a writer to release a rollout, not for time.
-                        pending_delay = pending_poll_seconds
                         held_locks = guard.process_probe.rollout_locks_held()
+                        lock_polled_at = time.monotonic()
                     else:
-                        pending_delay = min(
-                            (pending_delay or pending_poll_seconds / 2) * 2,
+                        backoff = min(
+                            max(backoff, pending_poll_seconds) * 2,
                             max_pending_poll_seconds,
                         )
                 else:
-                    pending_delay = None
+                    pending = False
+                    backoff = pending_poll_seconds
                 break
-        time.sleep(poll_seconds if pending_delay is None else pending_delay)
+        time.sleep(poll_seconds)
 
 
 def main() -> int:

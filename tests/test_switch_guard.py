@@ -384,6 +384,94 @@ class ForeverLoopTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+    def test_released_writer_lock_triggers_another_attempt(self) -> None:
+        """Closing one window is enough: retry as soon as a lock is released."""
+
+        calls: list[str] = []
+
+        class Probe:
+            def __init__(self) -> None:
+                self.lock_polls = 0
+
+            def codex_app_running(self) -> bool:
+                return True
+
+            def rollout_locks_held(self) -> int:
+                self.lock_polls += 1
+                return 2 if self.lock_polls <= 1 else 1
+
+        class FakeGuard:
+            codex_home = Path("/tmp/codex-home")
+            cc_home = Path("/tmp/cc-home")
+            process_probe = Probe()
+
+            @staticmethod
+            def run_once():
+                calls.append("run")
+                if len(calls) > 1:
+                    raise KeyboardInterrupt
+                return type(
+                    "D",
+                    (),
+                    {"action": "deferred", "fingerprint": "f" * 8, "unreadable": 0},
+                )()
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_forever(
+                FakeGuard(),
+                poll_seconds=0.01,
+                pending_poll_seconds=0.01,
+                max_pending_poll_seconds=0.02,
+                app_poll_seconds=0.01,
+                lock_poll_seconds=0.01,
+            )
+        self.assertEqual(len(calls), 2)
+
+    def test_pending_repair_without_a_release_waits_quietly(self) -> None:
+        """No writer releases anything, so no repeated re-planning happens."""
+
+        calls: list[str] = []
+
+        class Probe:
+            def __init__(self) -> None:
+                self.polls = 0
+
+            def codex_app_running(self) -> bool:
+                self.polls += 1
+                if self.polls > 4:
+                    raise KeyboardInterrupt
+                return True
+
+            def rollout_locks_held(self) -> int:
+                return 3
+
+        class FakeGuard:
+            codex_home = Path("/tmp/codex-home")
+            cc_home = Path("/tmp/cc-home")
+            process_probe = Probe()
+
+            @staticmethod
+            def run_once():
+                calls.append("run")
+                return type(
+                    "D",
+                    (),
+                    {"action": "deferred", "fingerprint": "f" * 8, "unreadable": 0},
+                )()
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_forever(
+                FakeGuard(),
+                poll_seconds=0.01,
+                pending_poll_seconds=0.01,
+                max_pending_poll_seconds=0.02,
+                app_poll_seconds=0.01,
+                lock_poll_seconds=0.01,
+            )
+        # One attempt at startup; the lock count never drops, so nothing repeats.
+        self.assertEqual(len(calls), 1)
+
+
 class ElapsedParseTest(unittest.TestCase):
     def test_parses_ps_etime_formats(self) -> None:
         self.assertEqual(_parse_elapsed("07:12"), 432.0)
