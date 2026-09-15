@@ -1,6 +1,6 @@
 ---
 name: codex-history-unify
-description: "Restore and unify local Codex session history after switching between Codex accounts or providers (DeepSeek vs OpenAI/Codex account). Use when conversations disappear from the sidebar after switching, local history is hidden per model_provider, or the user asks to refresh/show/restore old dialogs after switching in Codex or CC Switch. 用于切换 DeepSeek 与 Codex 账号后恢复侧边栏消失的本地会话。"
+description: "Use when Codex conversations disappear or fail after switching between DeepSeek and OpenAI/GPT, especially invalid_id_prefix, array_above_max_length, store=false item not found, remote compact failures, or model_provider history filtering in Codex or CC Switch."
 ---
 
 # Codex History Unify
@@ -11,6 +11,9 @@ Unify local Codex session history to the currently selected provider so that
 conversations created under another account (for example `openai` vs `custom`
 DeepSeek) reappear in the sidebar. The underlying data is never deleted; this
 skill relabels provider metadata and keeps baseline backups.
+
+It also repairs verified DeepSeek-to-GPT rollout incompatibilities without
+rewriting visible messages or valid GPT encrypted reasoning.
 
 ## Workflow
 
@@ -25,6 +28,29 @@ skill relabels provider metadata and keeps baseline backups.
 4. Verify with another dry run; it should report zero pending threads.
 5. If the sidebar still does not refresh, ask the user to restart Codex or
    toggle the sidebar view. Do not touch `archived` state or delete files.
+
+## Protocol migration after a model switch
+
+When a visible conversation fails after switching providers:
+
+1. Read the complete first API error and identify the target provider.
+2. Run `python3 scripts/migrate_protocol.py --target auto --dry-run`.
+3. For a GPT target, report the affected file and item counts, then run
+   `python3 scripts/migrate_protocol.py --target gpt --apply`. This performs
+   the three verified repairs in one pass:
+   - normalize non-`msg*` assistant response IDs and linked UI event IDs;
+   - remove DeepSeek plaintext reasoning response items;
+   - remove `rs_resp_*` reasoning references lacking encrypted payloads,
+     which cannot be replayed after `store=false`.
+4. Restart Codex before retrying the old conversation.
+5. For a DeepSeek target, the script is diagnostic-only. Do not reverse the
+   GPT cleanup mechanically; inspect the first real CC Switch/DeepSeek error
+   and preserve valid encrypted GPT reasoning until evidence identifies the
+   incompatible item type.
+
+Each GPT apply creates one compressed archive containing only changed rollout
+files. It retains the newest three protocol archives. Restore the latest with
+`python3 scripts/migrate_protocol.py --restore-latest`.
 
 ## Windows
 
@@ -63,6 +89,10 @@ Restoring also requires a Codex restart to take effect.
   script skips those automatically.
 - Keep backups in `~/.codex/skill-backups/unify-codex-history/`.
 - Do not claim data is lost; it is only hidden by provider filtering.
+- Use protocol migration only for provider-switch compatibility errors. Do
+  not remove reasoning items merely to reduce file size.
+- Never modify archived sessions unless the user asks to repair an archived
+  conversation.
 
 See [mechanism.md](references/mechanism.md) for the full data layout and why
 both the state database and rollout `session_meta` must be updated.
