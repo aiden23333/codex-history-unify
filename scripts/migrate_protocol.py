@@ -19,6 +19,14 @@ from pathlib import Path
 
 THREAD_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 
+# Item types the Responses API requires a call_id on in both directions.
+TOOL_ITEM_TYPES = (
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+)
+
 
 @dataclass
 class Change:
@@ -29,6 +37,7 @@ class Change:
     locked: bool = False
     truncated: bool = False
     structural: bool = False
+    orphan_tool_items: int = 0
 
     @property
     def writable(self) -> bool:
@@ -68,10 +77,11 @@ def is_incompatible_reasoning(payload: dict) -> bool:
     )
 
 
-def transform(rows: list[dict], target: str = "gpt") -> tuple[list[dict], int, int]:
+def transform(rows: list[dict], target: str = "gpt") -> tuple[list[dict], int, int, int]:
     output: list[dict] = []
     assistant_ids = 0
     reasoning_items = 0
+    orphan_tool_items = 0
     linked_ids: dict[str, str] = {}
 
     for row in rows:
@@ -79,6 +89,13 @@ def transform(rows: list[dict], target: str = "gpt") -> tuple[list[dict], int, i
         if not isinstance(payload, dict):
             output.append(row)
             continue
+        if row.get("type") == "response_item" and payload.get("type") in TOOL_ITEM_TYPES:
+            # Every provider requires call_id on a tool call and on its output.
+            # A row written without one cannot be replayed at all, so it is
+            # dropped instead of failing the whole conversation.
+            if not payload.get("call_id"):
+                orphan_tool_items += 1
+                continue
         if (
             target == "gpt"
             and row.get("type") == "response_item"
@@ -103,7 +120,7 @@ def transform(rows: list[dict], target: str = "gpt") -> tuple[list[dict], int, i
         item = payload.get("item")
         if isinstance(item, dict) and item.get("type") == "AgentMessage" and item.get("id") in linked_ids:
             item["id"] = linked_ids[item["id"]]
-    return output, assistant_ids, reasoning_items
+    return output, assistant_ids, reasoning_items, orphan_tool_items
 
 
 def _parse_line(line: str, path: Path, number: int) -> dict:
@@ -278,8 +295,8 @@ def plan(
         if read.unreadable:
             unreadable.append((path, read.unreadable))
             continue
-        migrated, ids, reasoning = transform(read.rows, target)
-        if ids or reasoning or read.structural:
+        migrated, ids, reasoning, orphans = transform(read.rows, target)
+        if ids or reasoning or orphans or read.structural:
             changes.append(
                 Change(
                     path,
@@ -289,6 +306,7 @@ def plan(
                     locked=locked,
                     truncated=read.truncated,
                     structural=read.structural,
+                    orphan_tool_items=orphans,
                 )
             )
     return PlanResult(changes=changes, unreadable=unreadable)
@@ -377,6 +395,7 @@ def main() -> int:
     print(f"files_to_change={len(changes)}")
     print(f"assistant_ids={sum(c.assistant_ids for c in changes)}")
     print(f"reasoning_items={sum(c.reasoning_items for c in changes)}")
+    print(f"orphan_tool_items={sum(c.orphan_tool_items for c in changes)}")
     print(f"locked_files_skipped={skipped}")
     print(f"structural_repairs={sum(1 for c in changes if c.structural)}")
     print(f"unreadable_files={len(planned.unreadable)}")

@@ -488,6 +488,7 @@ def main() -> int:
         print(f"cc_switch_changed={int(planned.cc_switch_changed)}")
         print(f"catalog_changed={int(planned.catalog_changed)}")
         print(f"unreadable={planned.unreadable}")
+        print(f"orphan_tool_items={planned.orphan_tool_items}")
         return 0
     if args.once:
         decision = guard.run_once()

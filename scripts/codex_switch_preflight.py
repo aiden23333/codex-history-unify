@@ -54,6 +54,7 @@ class ReconcileReport:
     backup_dir: Path | None = None
     deferred: int = 0
     busy: bool = False
+    orphan_tool_items: int = 0
     unreadable: int = 0
 
 
@@ -280,6 +281,9 @@ def reconcile(
         deferred=len(deferred_changes),
         busy=_sessions_busy(sessions, ACTIVE_WRITE_WINDOW_SECONDS),
         unreadable=len(protocol_plan.unreadable),
+        orphan_tool_items=sum(
+            change.orphan_tool_items for change in planned_protocol
+        ),
     )
     if not apply or not changed:
         return report
@@ -339,6 +343,7 @@ def main() -> int:
     print(f"cc_switch_changed={int(report.cc_switch_changed)}")
     print(f"catalog_changed={int(report.catalog_changed)}")
     print(f"deferred={report.deferred}")
+    print(f"orphan_tool_items={report.orphan_tool_items}")
     print(f"unreadable={report.unreadable}")
     if report.deferred:
         print(

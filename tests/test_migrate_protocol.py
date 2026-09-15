@@ -223,3 +223,49 @@ class ProtocolPlanTest(unittest.TestCase):
         planned = migrate_protocol.plan(self.sessions, self.locks, "gpt", lsof)
         self.assertEqual(len(planned.changes), 1)
         self.assertTrue(planned.changes[0].truncated)
+
+
+class OrphanToolItemTest(unittest.TestCase):
+    """A tool-call item without call_id cannot be replayed by any provider."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.sessions = root / "sessions"
+        self.locks = root / "locks"
+        self.rollout = self.sessions / "2026" / "09" / "15" / "rollout-2026-09-15T00-00-00-11111111-1111-1111-1111-111111111111.jsonl"
+        self.paired = {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "call_abc", "output": "ok"}}
+        self.orphan_output = {"type": "response_item", "payload": {"type": "function_call_output", "id": "fco_1", "name": "send_message_to_thread", "output": "delegated"}}
+        self.orphan_call = {"type": "response_item", "payload": {"type": "function_call", "id": "fc_1", "name": "exec", "arguments": "{}"}}
+        self.message = {"type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "msg_ok", "content": []}}
+        write_jsonl(self.rollout, [self.paired, self.orphan_output, self.orphan_call, self.message])
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_transform_drops_items_without_call_id(self) -> None:
+        from scripts import migrate_protocol
+
+        for target in ("gpt", "deepseek"):
+            rows, _, _, orphans = migrate_protocol.transform(
+                json.loads(json.dumps([self.paired, self.orphan_output, self.orphan_call, self.message])),
+                target,
+            )
+            self.assertEqual(orphans, 2, target)
+            types = [row["payload"]["type"] for row in rows]
+            self.assertEqual(types, ["function_call_output", "message"])
+
+    def test_plan_reports_orphan_tool_items(self) -> None:
+        from scripts import migrate_protocol
+
+        planned = migrate_protocol.plan(self.sessions, self.locks, "deepseek")
+        self.assertEqual(len(planned.changes), 1)
+        self.assertEqual(planned.changes[0].orphan_tool_items, 2)
+        self.assertEqual(planned.changes[0].assistant_ids, 0)
+
+    def test_clean_file_is_not_planned(self) -> None:
+        from scripts import migrate_protocol
+
+        write_jsonl(self.rollout, [self.paired, self.message])
+        planned = migrate_protocol.plan(self.sessions, self.locks, "deepseek")
+        self.assertEqual(planned.changes, [])
