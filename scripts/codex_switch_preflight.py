@@ -88,12 +88,23 @@ def _read_snapshot(codex_home: Path, cc_home: Path) -> TargetSnapshot:
     if configured_provider and configured_provider not in {provider_id, "deepseek" if target == "deepseek" else "codex-official"}:
         raise UnstableSwitchState("CC Switch settings and database disagree")
     provider_bucket = str(config.get("model_provider", "openai"))
+    catalog_path = codex_home / "cc-switch-model-catalog.json"
+    catalog_modalities: list[tuple[str, tuple[str, ...]]] = []
+    if catalog_path.exists():
+        catalog_data = json.loads(catalog_path.read_text(encoding="utf-8"))
+        for item in catalog_data.get("models", []):
+            slug = str(item.get("slug") or item.get("model") or "")
+            if "deepseek" in slug.lower():
+                catalog_modalities.append(
+                    (slug, tuple(item.get("input_modalities") or []))
+                )
     safe_fields = {
         "target": target,
         "provider_id": provider_id,
         "model": model,
         "provider_bucket": provider_bucket,
         "api_format": meta.get("apiFormat"),
+        "catalog_modalities": catalog_modalities,
     }
     digest = hashlib.sha256(
         json.dumps(safe_fields, sort_keys=True, separators=(",", ":")).encode()

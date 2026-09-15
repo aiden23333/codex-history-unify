@@ -87,6 +87,15 @@ class SwitchPreflightTest(unittest.TestCase):
         with self.assertRaises(preflight.UnstableSwitchState):
             preflight.read_stable_snapshot(self.codex_home, self.cc_home, stable_delay=0)
 
+    def test_catalog_regeneration_changes_fingerprint(self) -> None:
+        self.write_state(model="deepseek-v4-flash", current_provider="deepseek", api_format="openai_responses", proxy_enabled=True)
+        first = preflight.read_stable_snapshot(self.codex_home, self.cc_home, stable_delay=0)
+        catalog = json.loads((self.codex_home / "cc-switch-model-catalog.json").read_text())
+        catalog["models"][0]["input_modalities"] = ["text", "image"]
+        (self.codex_home / "cc-switch-model-catalog.json").write_text(json.dumps(catalog), encoding="utf-8")
+        second = preflight.read_stable_snapshot(self.codex_home, self.cc_home, stable_delay=0)
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
     def test_deepseek_reconcile_enforces_responses_and_preserves_reasoning(self) -> None:
         self.write_state(model="deepseek-v4-flash", current_provider="deepseek", api_format="openai_chat", proxy_enabled=True)
         snapshot = preflight.read_stable_snapshot(self.codex_home, self.cc_home, stable_delay=0)
