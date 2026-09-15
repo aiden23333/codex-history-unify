@@ -29,6 +29,11 @@ class UnstableSwitchState(RuntimeError):
     pass
 
 
+# A rollout written this recently means Codex is still producing a turn, so an
+# automatic restart would throw away the user's in-flight work.
+ACTIVE_WRITE_WINDOW_SECONDS = 15.0
+
+
 @dataclass(frozen=True)
 class TargetSnapshot:
     target: Literal["gpt", "deepseek"]
@@ -47,6 +52,23 @@ class ReconcileReport:
     cc_switch_changed: bool = False
     catalog_changed: bool = False
     backup_dir: Path | None = None
+    deferred: int = 0
+    busy: bool = False
+
+
+def _sessions_busy(sessions: Path, window: float) -> bool:
+    """True when any rollout was appended recently, i.e. a turn is running."""
+
+    if not sessions.exists():
+        return False
+    now = time.time()
+    for path in sessions.rglob("*.jsonl"):
+        try:
+            if now - path.stat().st_mtime <= window:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _file_signature(path: Path) -> tuple[int, int] | None:
@@ -119,21 +141,38 @@ def _read_snapshot(codex_home: Path, cc_home: Path) -> TargetSnapshot:
     )
 
 
+def _read_snapshot_retryable(codex_home: Path, cc_home: Path) -> TargetSnapshot:
+    """Read the switch state, reporting half-written files as instability.
+
+    CC Switch rewrites its configuration and database while it applies a
+    switch, so a torn read is an expected transient condition rather than a
+    damaged installation.
+    """
+
+    try:
+        return _read_snapshot(codex_home, cc_home)
+    except (sqlite3.Error, json.JSONDecodeError, KeyError, OSError, tomllib.TOMLDecodeError) as exc:
+        raise UnstableSwitchState(f"CC Switch state is unreadable: {type(exc).__name__}") from exc
+
+
 def read_stable_snapshot(
     codex_home: Path, cc_home: Path, stable_delay: float = 0.8
 ) -> TargetSnapshot:
+    # Only the small files whose contents select the target are compared by
+    # signature. The CC Switch database is rewritten continuously while it runs
+    # (checkpoints touch its mtime without changing any relevant value), so the
+    # parsed snapshot comparison below is the authority for that state.
     paths = [
         codex_home / "config.toml",
         cc_home / "settings.json",
-        cc_home / "cc-switch.db",
-        cc_home / "cc-switch.db-wal",
+        codex_home / "cc-switch-model-catalog.json",
     ]
     before = [_file_signature(path) for path in paths]
-    first = _read_snapshot(codex_home, cc_home)
+    first = _read_snapshot_retryable(codex_home, cc_home)
     if stable_delay:
         time.sleep(stable_delay)
     after = [_file_signature(path) for path in paths]
-    second = _read_snapshot(codex_home, cc_home)
+    second = _read_snapshot_retryable(codex_home, cc_home)
     if before != after or first != second:
         raise UnstableSwitchState("CC Switch state is still changing")
     return second
@@ -211,13 +250,13 @@ def reconcile(
     apply: bool,
 ) -> ReconcileReport:
     sessions = codex_home / "sessions"
-    protocol_changes, locked = migrate_protocol.scan(
+    planned_protocol = migrate_protocol.plan(
         sessions,
         codex_home / "thread-writer-locks",
         snapshot.target,
     )
-    if locked:
-        raise RuntimeError(f"Codex still owns {locked} rollout file(s)")
+    protocol_changes = [change for change in planned_protocol if change.writable]
+    deferred_changes = [change for change in planned_protocol if not change.writable]
     provider_changes = sync_provider.plan_provider_sync(
         codex_home, snapshot.provider_bucket
     )
@@ -229,13 +268,15 @@ def reconcile(
         meta, cc_changed = _cc_meta_plan(cc_database, snapshot.provider_id)
     catalog_path = codex_home / "cc-switch-model-catalog.json"
     catalog, catalog_changed = _catalog_plan(catalog_path)
-    changed = bool(protocol_changes or actionable_provider or cc_changed or catalog_changed)
+    changed = bool(planned_protocol or actionable_provider or cc_changed or catalog_changed)
     report = ReconcileReport(
         changed=changed,
-        protocol_files=len(protocol_changes),
+        protocol_files=len(planned_protocol),
         provider_threads=len(actionable_provider),
         cc_switch_changed=cc_changed,
         catalog_changed=catalog_changed,
+        deferred=len(deferred_changes),
+        busy=_sessions_busy(sessions, ACTIVE_WRITE_WINDOW_SECONDS),
     )
     if not apply or not changed:
         return report
@@ -294,6 +335,12 @@ def main() -> int:
     print(f"provider_threads={report.provider_threads}")
     print(f"cc_switch_changed={int(report.cc_switch_changed)}")
     print(f"catalog_changed={int(report.catalog_changed)}")
+    print(f"deferred={report.deferred}")
+    if report.deferred:
+        print(
+            "warning=rollout_files_owned_by_another_process",
+            file=sys.stderr,
+        )
     return 0
 
 

@@ -133,3 +133,62 @@ class ProtocolMigrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProtocolPlanTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.sessions = root / "sessions"
+        self.locks = root / "locks"
+        self.rollout = self.sessions / "2026" / "09" / "15" / "rollout-2026-09-15T00-00-00-11111111-1111-1111-1111-111111111111.jsonl"
+        write_jsonl(
+            self.rollout,
+            [
+                {"type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "resp_abc_msg", "content": []}},
+            ],
+        )
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _fake_lsof(self, body: str) -> Path:
+        path = Path(self.temp.name) / "lsof-fake"
+        path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        os.chmod(path, 0o700)
+        return path
+
+    def _lock_marker(self) -> None:
+        self.locks.mkdir(parents=True, exist_ok=True)
+        (self.locks / "11111111-1111-1111-1111-111111111111.lock").touch()
+
+    def test_plan_reports_locked_change_without_writing(self) -> None:
+        from scripts import migrate_protocol
+
+        self._lock_marker()
+        lsof = self._fake_lsof("echo 4242\nexit 0")
+        changes = migrate_protocol.plan(self.sessions, self.locks, "gpt", lsof)
+        self.assertEqual(len(changes), 1)
+        self.assertTrue(changes[0].locked)
+        self.assertFalse(changes[0].truncated)
+        self.assertEqual(read_jsonl(self.rollout)[0]["payload"]["id"], "resp_abc_msg")
+
+    def test_scan_keeps_skipping_locked_rollouts(self) -> None:
+        from scripts import migrate_protocol
+
+        self._lock_marker()
+        lsof = self._fake_lsof("echo 4242\nexit 0")
+        changes, skipped = migrate_protocol.scan(self.sessions, self.locks, "gpt", lsof)
+        self.assertEqual(changes, [])
+        self.assertEqual(skipped, 1)
+
+    def test_plan_marks_truncated_tail_as_not_writable(self) -> None:
+        from scripts import migrate_protocol
+
+        self._lock_marker()
+        lsof = self._fake_lsof("echo 4242\nexit 0")
+        with self.rollout.open("a", encoding="utf-8") as fh:
+            fh.write('{"type": "response_item", "payload": {"type": "mess')
+        changes = migrate_protocol.plan(self.sessions, self.locks, "gpt", lsof)
+        self.assertEqual(len(changes), 1)
+        self.assertTrue(changes[0].truncated)

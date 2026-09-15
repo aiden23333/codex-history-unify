@@ -26,6 +26,12 @@ class Change:
     rows: list[dict]
     assistant_ids: int
     reasoning_items: int
+    locked: bool = False
+    truncated: bool = False
+
+    @property
+    def writable(self) -> bool:
+        return not (self.locked or self.truncated)
 
 
 def default_home() -> Path:
@@ -99,15 +105,44 @@ def transform(rows: list[dict], target: str = "gpt") -> tuple[list[dict], int, i
     return output, assistant_ids, reasoning_items
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    rows = []
+def _parse_line(line: str, path: Path, number: int) -> dict:
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSONL: {path}:{number}: {exc}") from exc
+
+
+def read_jsonl_rows(
+    path: Path, tolerate_truncated_tail: bool = False
+) -> tuple[list[dict], bool]:
+    """Parse a rollout, optionally ignoring one unterminated final line.
+
+    A rollout that a live writer is still appending to can end with a partial
+    line. The partial row is unusable, but a reader only needs the remaining
+    rows to decide whether the file needs repair; such files are never written
+    in the same pass.
+    """
+
+    rows: list[dict] = []
+    truncated = False
+    pending: tuple[int, str] | None = None
     with path.open("r", encoding="utf-8") as fh:
         for number, line in enumerate(fh, 1):
-            if line.strip():
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"invalid JSONL: {path}:{number}: {exc}") from exc
+            if pending is not None:
+                rows.append(_parse_line(pending[1], path, pending[0]))
+            pending = (number, line)
+    if pending is not None and pending[1].strip():
+        try:
+            rows.append(_parse_line(pending[1], path, pending[0]))
+        except ValueError:
+            if not tolerate_truncated_tail:
+                raise
+            truncated = True
+    return rows, truncated
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    rows, _ = read_jsonl_rows(path)
     return rows
 
 
@@ -130,23 +165,40 @@ def writer_in_use(path: Path, lock_dir: Path, lsof_bin: Path | None = None) -> b
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
+def plan(
+    sessions_dir: Path,
+    lock_dir: Path,
+    target: str = "gpt",
+    lsof_bin: Path | None = None,
+) -> list[Change]:
+    """Plan repairs for every rollout, marking entries that must not be written.
+
+    Files a live writer holds, and files with an unparsable final line, are
+    reported with `locked`/`truncated` set so a caller can decide whether the
+    app has to be restarted before the repair can be applied.
+    """
+
+    changes: list[Change] = []
+    for path in sorted(sessions_dir.rglob("*.jsonl")):
+        locked = writer_in_use(path, lock_dir, lsof_bin)
+        rows, truncated = read_jsonl_rows(path, tolerate_truncated_tail=locked)
+        migrated, ids, reasoning = transform(rows, target)
+        if ids or reasoning:
+            changes.append(
+                Change(path, migrated, ids, reasoning, locked=locked, truncated=truncated)
+            )
+    return changes
+
+
 def scan(
     sessions_dir: Path,
     lock_dir: Path,
     target: str = "gpt",
     lsof_bin: Path | None = None,
 ) -> tuple[list[Change], int]:
-    changes: list[Change] = []
-    skipped = 0
-    for path in sorted(sessions_dir.rglob("*.jsonl")):
-        if writer_in_use(path, lock_dir, lsof_bin):
-            skipped += 1
-            continue
-        rows = read_jsonl(path)
-        migrated, ids, reasoning = transform(rows, target)
-        if ids or reasoning:
-            changes.append(Change(path, migrated, ids, reasoning))
-    return changes, skipped
+    planned = plan(sessions_dir, lock_dir, target, lsof_bin)
+    writable = [change for change in planned if change.writable]
+    return writable, len(planned) - len(writable)
 
 
 def create_backup(changes: list[Change], sessions_dir: Path, backup_root: Path) -> Path:
