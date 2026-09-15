@@ -1,5 +1,11 @@
 # Automatic CC Switch → Codex Preflight Implementation Plan
 
+Status (updated 2026-09-15):
+- Task 1–4 and Task 5 steps 1–4, 6–8: done.
+- Task 5 step 5 (live close → switch → open verification): pending the next real CC Switch switch performed by the user. The installed guard runs it automatically; check `~/.codex/switch-guard/guard.log` for `action=` / `unreadable=`.
+- Hardening added during verification (beyond the original plan): archived threads no longer block convergence; CC Switch database checkpoints no longer defeat the stability check; structurally damaged rollouts are recovered or reported instead of aborting the run; the automatic restart is limited to a freshly launched, idle app.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make DeepSeek ↔ GPT switches in CC Switch reconcile every local unarchived Codex task before its first usable launch, without user confirmation, commands, or a second manual restart.
