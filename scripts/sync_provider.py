@@ -25,10 +25,21 @@ import shutil
 import sqlite3
 import sys
 import tomllib
+from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 USER_VISIBLE_SOURCES = ("vscode", "exec")
+
+
+@dataclass
+class ProviderSyncReport:
+    changed: bool
+    state_rows: int = 0
+    catalog_rows: int = 0
+    rollout_files: int = 0
+    backup_dir: Path | None = None
 
 
 def codex_home() -> Path:
@@ -75,7 +86,7 @@ def discover_threads(state_db: Path) -> list[dict]:
         print(f"State DB not found: {state_db}", file=sys.stderr)
         return []
     rows = []
-    with connect_ro(state_db) as con:
+    with closing(connect_ro(state_db)) as con:
         cur = con.execute(
             "SELECT id, rollout_path, model_provider, source, archived, preview "
             "FROM threads"
@@ -115,11 +126,29 @@ def compute_changes(rows: list[dict], target: str, home: Path) -> list[dict]:
     return changes
 
 
+def plan_provider_sync(home: Path, target: str) -> list[dict]:
+    return compute_changes(discover_threads(home / "state_5.sqlite"), target, home)
+
+
+def apply_provider_sync(home: Path, target: str, changes: list[dict]) -> ProviderSyncReport:
+    actionable = [change for change in changes if not change["skipped"]]
+    if not actionable:
+        return ProviderSyncReport(changed=False)
+    backup_dir = backup_snapshot(home, target, changes)
+    return ProviderSyncReport(
+        changed=True,
+        state_rows=update_state_db(home, target, changes),
+        catalog_rows=update_catalog_db(home, target, changes),
+        rollout_files=update_rollouts(changes, target),
+        backup_dir=backup_dir,
+    )
+
+
 def sqlite_backup(src: Path, dst: Path) -> bool:
     if not src.exists():
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(str(src)) as src_con, sqlite3.connect(str(dst)) as dst_con:
+    with closing(sqlite3.connect(str(src))) as src_con, closing(sqlite3.connect(str(dst))) as dst_con:
         src_con.backup(dst_con)
     return True
 
@@ -173,7 +202,7 @@ def update_state_db(home: Path, target: str, changes: list[dict]) -> int:
     ids = [c["thread_id"] for c in changes if not c["skipped"]]
     if not ids:
         return 0
-    with sqlite3.connect(str(state_db)) as con:
+    with closing(sqlite3.connect(str(state_db))) as con:
         con.executemany(
             "UPDATE threads SET model_provider = ? WHERE id = ?",
             [(target, thread_id) for thread_id in ids],
@@ -187,7 +216,7 @@ def update_catalog_db(home: Path, target: str, changes: list[dict]) -> int:
     ids = [c["thread_id"] for c in changes if not c["skipped"]]
     if not catalog_db.exists() or not ids:
         return 0
-    with sqlite3.connect(str(catalog_db)) as con:
+    with closing(sqlite3.connect(str(catalog_db))) as con:
         row = con.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name='local_thread_catalog'"
@@ -320,24 +349,20 @@ def main() -> int:
         return restore(home, args.backup_dir)
 
     target = args.provider or current_provider(home)
-    rows = discover_threads(home / "state_5.sqlite")
-    changes = compute_changes(rows, target, home)
+    changes = plan_provider_sync(home, target)
     print_report(target, changes)
 
     if not args.apply:
         print("\nDry-run only. Re-run with --apply to perform the sync.")
         return 0
 
-    backup_dir = backup_snapshot(home, target, changes)
-    print("\nBaseline backup created:", backup_dir)
+    report = apply_provider_sync(home, target, changes)
+    if report.backup_dir:
+        print("\nBaseline backup created:", report.backup_dir)
 
-    state_count = update_state_db(home, target, changes)
-    catalog_count = update_catalog_db(home, target, changes)
-    rollout_count = update_rollouts(changes, target)
-
-    print(f"Updated state DB threads: {state_count}")
-    print(f"Updated local thread catalog rows: {catalog_count}")
-    print(f"Updated rollout files: {rollout_count}")
+    print(f"Updated state DB threads: {report.state_rows}")
+    print(f"Updated local thread catalog rows: {report.catalog_rows}")
+    print(f"Updated rollout files: {report.rollout_files}")
     print("\nRestart Codex (or toggle the sidebar view) if threads do not appear.")
     return 0
 
