@@ -78,7 +78,7 @@ class SwitchGuardTest(unittest.TestCase):
         def reader(*args, **kwargs):
             return self.snapshot
 
-        def reconciler(snapshot, codex_home, cc_home, *, apply):
+        def reconciler(snapshot, codex_home, cc_home, *, apply, scope="all"):
             self.apply_calls.append(apply)
             if report is not None:
                 return report
@@ -159,7 +159,8 @@ class SwitchGuardTest(unittest.TestCase):
         self.assertEqual(decision.action, "deferred")
         self.assertEqual(apps.quit_calls, 0)
         self.assertEqual(apps.open_calls, 0)
-        self.assertEqual(self.apply_calls, [False])
+        # Nothing writable, so the guard re-plans and waits for a close.
+        self.assertEqual(self.apply_calls, [False, False])
         state = self.state(guard)
         self.assertEqual(state["last_error"], "deferred_app_running")
         self.assertEqual(state["pending_fingerprint"], "fingerprint-1")
@@ -174,7 +175,8 @@ class SwitchGuardTest(unittest.TestCase):
         self.assertEqual(decision.action, "deferred")
         self.assertEqual(apps.quit_calls, 0)
         self.assertEqual(apps.open_calls, 0)
-        self.assertEqual(self.apply_calls, [False])
+        # No writable rollout work, so the guard re-plans and waits for a close.
+        self.assertEqual(self.apply_calls, [False, False])
 
     def test_unknown_app_uptime_never_restarts(self) -> None:
         guard, apps = self.make_guard(opened=True)
@@ -278,6 +280,70 @@ class SwitchGuardTest(unittest.TestCase):
             guard.run_once()
         self.assertEqual(apps.quit_calls, 1)
         self.assertEqual(apps.open_calls, 1)
+
+
+    def test_writable_rollouts_are_repaired_while_codex_runs(self) -> None:
+        """A closed window releases its rollout, so no restart is needed."""
+
+        probe = FakeProbe(True, uptime=3600.0)
+        apps = FakeApps(probe)
+        calls: list[tuple[bool, str]] = []
+        left = {"dirty": True}
+
+        def reconciler(snapshot, codex_home, cc_home, *, apply, scope="all"):
+            calls.append((apply, scope))
+            if apply:
+                left["dirty"] = False
+                return ReconcileReport(changed=True, protocol_files=1)
+            return ReconcileReport(
+                changed=left["dirty"], protocol_files=int(left["dirty"])
+            )
+
+        guard = Guard(
+            codex_home=self.root / "codex",
+            cc_home=self.root / "cc",
+            state_path=self.root / "state.json",
+            process_probe=probe,
+            app_controller=apps,
+            snapshot_reader=lambda *a, **k: self.snapshot,
+            reconciler=reconciler,
+            close_timeout=0.1,
+        )
+        decision = guard.run_once()
+        self.assertEqual(decision.action, "repaired_rollouts_while_running")
+        self.assertEqual(apps.quit_calls, 0)
+        self.assertEqual(apps.open_calls, 0)
+        self.assertEqual(calls, [(False, "all"), (True, "rollouts"), (False, "all")])
+        self.assertEqual(self.state(guard)["last_successful_fingerprint"], "fingerprint-1")
+
+    def test_pending_repair_stays_pending_when_other_work_remains(self) -> None:
+        probe = FakeProbe(True, uptime=3600.0)
+        apps = FakeApps(probe)
+        calls: list[tuple[bool, str]] = []
+
+        def reconciler(snapshot, codex_home, cc_home, *, apply, scope="all"):
+            calls.append((apply, scope))
+            # Rollouts are writable, but the provider labels still need a
+            # closed app, so the plan never becomes clean.
+            return ReconcileReport(
+                changed=True, protocol_files=1, provider_threads=1
+            )
+
+        guard = Guard(
+            codex_home=self.root / "codex",
+            cc_home=self.root / "cc",
+            state_path=self.root / "state.json",
+            process_probe=probe,
+            app_controller=apps,
+            snapshot_reader=lambda *a, **k: self.snapshot,
+            reconciler=reconciler,
+            close_timeout=0.1,
+        )
+        decision = guard.run_once()
+        self.assertEqual(decision.action, "deferred")
+        self.assertEqual(apps.quit_calls, 0)
+        self.assertEqual(calls[1][1], "rollouts")
+        self.assertNotIn("last_successful_fingerprint", self.state(guard))
 
 
 class ForeverLoopTest(unittest.TestCase):

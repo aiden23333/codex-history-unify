@@ -250,7 +250,20 @@ def reconcile(
     cc_home: Path,
     *,
     apply: bool,
+    scope: str = "all",
 ) -> ReconcileReport:
+    """Plan one reconciliation, and optionally apply part of it.
+
+    `scope="rollouts"` writes only rollout repairs. Codex can keep running for
+    those because every file a live writer holds is still skipped; the provider
+    labels, CC Switch card, and model catalog need the app closed and are left
+    for a full pass.
+    """
+
+    if scope not in ("all", "rollouts"):
+        raise ValueError(f"unknown reconcile scope: {scope}")
+    apply_rollouts = scope in ("all", "rollouts")
+    apply_config = scope == "all"
     sessions = codex_home / "sessions"
     protocol_plan = migrate_protocol.plan(
         sessions,
@@ -289,18 +302,18 @@ def reconcile(
         return report
 
     guarded_files = [cc_home / "settings.json", cc_database, catalog_path]
-    if cc_changed or catalog_changed:
+    if apply_config and (cc_changed or catalog_changed):
         report.backup_dir = _backup_switch_files(codex_home, cc_home, guarded_files)
-    if cc_changed and meta is not None:
+    if apply_config and cc_changed and meta is not None:
         with closing(sqlite3.connect(str(cc_database))) as con:
             con.execute(
                 "UPDATE providers SET meta=? WHERE app_type='codex' AND id=?",
                 (json.dumps(meta, ensure_ascii=False, separators=(",", ":")), snapshot.provider_id),
             )
             con.commit()
-    if catalog_changed and catalog is not None:
+    if apply_config and catalog_changed and catalog is not None:
         _atomic_json(catalog_path, catalog)
-    if protocol_changes:
+    if apply_rollouts and protocol_changes:
         backup = migrate_protocol.create_backup(
             protocol_changes,
             sessions,
@@ -309,13 +322,14 @@ def reconcile(
         for change in protocol_changes:
             migrate_protocol.write_rows(change.path, change.rows)
         migrate_protocol.prune_backups(backup.parent, 3)
-    sync_provider.apply_provider_sync(
-        codex_home, snapshot.provider_bucket, provider_changes
-    )
-    for path in (codex_home / "state_5.sqlite", codex_home / "sqlite" / "codex-dev.db", cc_database):
-        _validate_sqlite(path)
-    if catalog_path.exists():
-        json.loads(catalog_path.read_text(encoding="utf-8"))
+    if apply_config:
+        sync_provider.apply_provider_sync(
+            codex_home, snapshot.provider_bucket, provider_changes
+        )
+        for path in (codex_home / "state_5.sqlite", codex_home / "sqlite" / "codex-dev.db", cc_database):
+            _validate_sqlite(path)
+        if catalog_path.exists():
+            json.loads(catalog_path.read_text(encoding="utf-8"))
     return report
 
 
@@ -326,10 +340,22 @@ def main() -> int:
     parser.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
     parser.add_argument("--cc-home", type=Path, default=Path.home() / ".cc-switch")
     parser.add_argument("--stable-delay", type=float, default=0.8)
+    parser.add_argument(
+        "--scope",
+        choices=("all", "rollouts"),
+        default="all",
+        help="apply rollout repairs only, leaving configuration for a full pass",
+    )
     args = parser.parse_args()
     try:
         snapshot = read_stable_snapshot(args.codex_home, args.cc_home, args.stable_delay)
-        report = reconcile(snapshot, args.codex_home, args.cc_home, apply=args.apply)
+        report = reconcile(
+            snapshot,
+            args.codex_home,
+            args.cc_home,
+            apply=args.apply,
+            scope=args.scope,
+        )
     except (OSError, ValueError, sqlite3.Error, RuntimeError, tomllib.TOMLDecodeError) as exc:
         print(f"preflight_error={exc}", file=sys.stderr)
         return 1

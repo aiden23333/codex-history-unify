@@ -33,6 +33,7 @@ class ProcessProbe(Protocol):
     def codex_app_running(self) -> bool: ...
     def codex_app_uptime_seconds(self) -> float | None: ...
     def codex_rollouts_open(self) -> bool: ...
+    def rollout_locks_held(self) -> int: ...
 
 
 class AppController(Protocol):
@@ -105,6 +106,27 @@ class CodexProcessProbe:
             check=False,
         )
         return result.returncode == 0 and bool(result.stdout.strip())
+
+    def rollout_locks_held(self) -> int:
+        """How many processes currently hold a thread writer lock.
+
+        While Codex runs, a deferred repair can only make progress when a writer
+        releases one of these locks, so this cheap count gates the retry.
+        """
+
+        lock_dir = self.codex_home / "thread-writer-locks"
+        if not lock_dir.is_dir():
+            return 0
+        locks = sorted(lock_dir.glob("*.lock"))[:64]
+        if not locks:
+            return 0
+        result = subprocess.run(
+            ["/usr/sbin/lsof", "-t", *[str(path) for path in locks]],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return len({line.strip() for line in result.stdout.splitlines() if line.strip()})
 
 
 LsofProcessProbe = CodexProcessProbe
@@ -275,6 +297,21 @@ class Guard:
     def _read_snapshot(self) -> TargetSnapshot:
         return self.snapshot_reader(self.codex_home, self.cc_home, stable_delay=0.8)
 
+    def _apply_rollouts(
+        self, snapshot: TargetSnapshot, planned: ReconcileReport
+    ) -> ReconcileReport | None:
+        """Write rollout repairs only, which is safe while Codex keeps running.
+
+        Provider labels, the CC Switch card and the model catalog still need a
+        closed app, so those are left for the full pass.
+        """
+
+        if not getattr(planned, "protocol_files", 0):
+            return None
+        return self.reconciler(
+            snapshot, self.codex_home, self.cc_home, apply=True, scope="rollouts"
+        )
+
     def run_once(self) -> GuardDecision:
         snapshot = self._read_snapshot()
         state = self._load_state()
@@ -294,9 +331,26 @@ class Guard:
         restarted = False
         if self.process_probe.codex_app_running():
             if not self._restart_allowed(planned):
-                # The app has been running for a while or a turn is in flight.
-                # Bouncing it would destroy the user's work for no gain: the
-                # repairs are applied when Codex is next closed.
+                # The app has been running for a while or a turn is in flight, so
+                # it must not be bounced. Rollout files that no writer holds can
+                # still be repaired in place; anything else waits for the close.
+                try:
+                    self._apply_rollouts(snapshot, planned)
+                except Exception as exc:
+                    state["last_error"] = type(exc).__name__
+                    self._save_state(state)
+                    raise
+                remaining = self.reconciler(
+                    snapshot, self.codex_home, self.cc_home, apply=False
+                )
+                if not remaining.changed:
+                    state["last_successful_fingerprint"] = snapshot.fingerprint
+                    state.pop("last_error", None)
+                    state.pop("pending_fingerprint", None)
+                    self._save_state(state)
+                    return GuardDecision(
+                        "repaired_rollouts_while_running", snapshot.fingerprint, unreadable
+                    )
                 state["last_error"] = "deferred_app_running"
                 state["pending_fingerprint"] = snapshot.fingerprint
                 self._save_state(state)
@@ -408,6 +462,7 @@ def run_forever(
     previous = None
     logged_error = None
     pending_delay: float | None = None
+    held_locks: int | None = None
     app_running: bool | None = None
     app_polled_at = 0.0
     print(
@@ -424,7 +479,15 @@ def run_forever(
             app_polled_at = now
             switched_app_state = app_running is not None and running != app_running
             app_running = running
-        if current != previous or pending_delay is not None or switched_app_state:
+        retry_ready = pending_delay is not None
+        if retry_ready and app_running:
+            # While Codex runs, a pending repair can only progress when a writer
+            # releases a rollout, so re-plan only when that set changes.
+            held_now = guard.process_probe.rollout_locks_held()
+            retry_ready = held_now != held_locks
+            held_locks = held_now
+
+        if current != previous or switched_app_state or retry_ready:
             previous = current
             for retry_delay in (0.0, *retries):
                 if retry_delay:
@@ -453,11 +516,16 @@ def run_forever(
                     f" fingerprint={decision.fingerprint[:12]}{detail}",
                     flush=True,
                 )
-                if decision.action.startswith("deferred") and not app_running:
-                    pending_delay = min(
-                        (pending_delay or pending_poll_seconds / 2) * 2,
-                        max_pending_poll_seconds,
-                    )
+                if decision.action.startswith("deferred"):
+                    if app_running:
+                        # Waiting for a writer to release a rollout, not for time.
+                        pending_delay = pending_poll_seconds
+                        held_locks = guard.process_probe.rollout_locks_held()
+                    else:
+                        pending_delay = min(
+                            (pending_delay or pending_poll_seconds / 2) * 2,
+                            max_pending_poll_seconds,
+                        )
                 else:
                     pending_delay = None
                 break

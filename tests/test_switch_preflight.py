@@ -134,6 +134,30 @@ class SwitchPreflightTest(unittest.TestCase):
         self.assertTrue(first.changed)
         self.assertFalse(second.changed)
 
+    def test_rollout_scope_repairs_history_without_touching_configuration(self) -> None:
+        """Codex can stay open for rollout repairs; the rest needs it closed."""
+
+        self.write_state(model="deepseek-v4-flash", current_provider="deepseek", api_format="openai_chat", proxy_enabled=True)
+        snapshot = preflight.read_stable_snapshot(self.codex_home, self.cc_home, stable_delay=0)
+        report = preflight.reconcile(
+            snapshot, self.codex_home, self.cc_home, apply=True, scope="rollouts"
+        )
+        rows = [json.loads(line) for line in self.rollout.read_text().splitlines()]
+        self.assertEqual(rows[1]["payload"]["id"], "msg_abc")
+        self.assertTrue(report.changed)
+        with closing(sqlite3.connect(self.cc_home / "cc-switch.db")) as con:
+            meta = json.loads(con.execute("SELECT meta FROM providers WHERE id='deepseek'").fetchone()[0])
+        self.assertEqual(meta["apiFormat"], "openai_chat")
+        catalog = json.loads((self.codex_home / "cc-switch-model-catalog.json").read_text())
+        self.assertEqual(catalog["models"][0]["input_modalities"], ["text"])
+        self.assertIsNone(report.backup_dir)
+
+    def test_unknown_scope_is_rejected(self) -> None:
+        self.write_state(model="gpt-5.6-sol", current_provider="codex-official", api_format="openai_responses", proxy_enabled=False)
+        snapshot = preflight.read_stable_snapshot(self.codex_home, self.cc_home, stable_delay=0)
+        with self.assertRaises(ValueError):
+            preflight.reconcile(snapshot, self.codex_home, self.cc_home, apply=True, scope="everything")
+
 
 if __name__ == "__main__":
     unittest.main()
