@@ -60,6 +60,12 @@ What the guard does on every detected switch:
 - Repairs rollout files that no writer holds even while Codex keeps running, so
   closing one broken window is enough: the guard retries as soon as that window
   releases its writer lock, without restarting the app.
+- Detects a released writer lock within about two seconds, so closing and
+  reopening a single window is enough for the repair to land.
+- Caches rollouts already verified clean in `~/.codex/switch-guard/scan-cache.json`
+  keyed by size and mtime, which keeps a rescan near two seconds instead of
+  re-reading every local rollout. Any append invalidates its entry, the cache is
+  per target, and it is versioned so changed repair rules force a full rescan.
 - Retries a repair that another process blocks with backoff (20 s up to 300 s)
   instead of looping or reporting success it did not achieve; a repair blocked
   while Codex runs is retried as soon as the app closes.
