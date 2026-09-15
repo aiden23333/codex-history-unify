@@ -7,7 +7,7 @@
 - 将本地会话统一到当前 provider（`openai` / `custom`）
 - 自动备份 `state_5.sqlite`、`codex-dev.db` 和 rollout 文件
 - 支持 `--restore` 回滚
-- 兼容 CC Switch 的“统一 Codex 会话历史”
+- 安装时同时打开 CC Switch 的“统一 Codex 会话历史”开关
 - 支持 macOS / Windows
 
 ## 安装
@@ -33,6 +33,11 @@ python3 scripts/install_switch_guard.py --apply
 后台完成会话 ID、reasoning、provider 标签、DeepSeek 原生 Responses 与模型目录
 `text`/`image` 的校正，首次打开即可正常使用所有未归档任务。
 
+安装动作只写两处：`~/Library/LaunchAgents/com.aiden.codex-switch-guard.plist`，
+以及 CC Switch `settings.json` 里的 `unifyCodexSessionHistory = true`（其余设置项
+一律不动，JSON 无法解析时只报告、不覆盖）。`--uninstall` 只移除 LaunchAgent，
+状态、日志、备份与这个开关都刻意保留。
+
 只读检查命令：
 
 ```bash
@@ -43,8 +48,9 @@ python3 scripts/install_switch_guard.py --uninstall
 
 守护进程只在 Codex 刚启动（3 分钟内）且没有任务正在生成时才会自动重启一次；
 长时间运行中的 Codex 永不被中断，待修复内容会在下次关闭时补齐。
+只读诊断入口：`python3 scripts/codex_switch_guard.py --plan-only`。
 
-## 手动使用
+## 手动兜底（Windows、未安装守护、或回滚）
 
 在 Codex 中说：使用 `$codex-history-unify` 刷新会话。
 

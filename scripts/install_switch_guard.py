@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -22,6 +23,40 @@ Runner = Callable[[Sequence[str]], object]
 class InstallReport:
     changed: bool
     plist_path: Path
+    cc_settings_changed: bool = False
+
+
+def _ensure_cc_switch_settings(cc_home: Path, *, apply: bool) -> bool:
+    """Keep CC Switch's own Codex history bucket enabled.
+
+    The guard already relabels history itself; this second switch keeps CC
+    Switch from discarding the shared bucket when it rewrites its own state.
+    Only that single flag is touched, and a file that cannot be parsed is left
+    exactly as it is.
+    """
+
+    path = cc_home / "settings.json"
+    try:
+        original = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    try:
+        data = json.loads(original)
+    except json.JSONDecodeError:
+        print(f"warning: {path} is not valid JSON; left unchanged", file=sys.stderr)
+        return False
+    if not isinstance(data, dict) or data.get("unifyCodexSessionHistory") is True:
+        return False
+    if not apply:
+        return True
+    data["unifyCodexSessionHistory"] = True
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    json.loads(temp.read_text(encoding="utf-8"))
+    os.replace(temp, path)
+    return True
 
 
 def _render(skill_dir: Path, codex_home: Path) -> str:
@@ -52,6 +87,7 @@ def install(
     skill_dir: Path,
     launch_agents_dir: Path,
     *,
+    cc_home: Path | None = None,
     apply: bool,
     runner: Runner | None = None,
 ) -> InstallReport:
@@ -63,6 +99,9 @@ def install(
     except FileNotFoundError:
         pass
     changed = existing != rendered
+    cc_settings_changed = (
+        _ensure_cc_switch_settings(cc_home, apply=apply) if cc_home else False
+    )
     if apply and changed:
         launch_agents_dir.mkdir(parents=True, exist_ok=True)
         (codex_home / "switch-guard").mkdir(parents=True, exist_ok=True)
@@ -77,7 +116,11 @@ def install(
             except Exception:
                 pass
             _launchctl(runner, "bootstrap", plist_path)
-    return InstallReport(changed=changed, plist_path=plist_path)
+    return InstallReport(
+        changed=changed,
+        plist_path=plist_path,
+        cc_settings_changed=cc_settings_changed,
+    )
 
 
 def uninstall(
@@ -135,11 +178,14 @@ def main() -> int:
             args.codex_home,
             skill_dir,
             args.launch_agents_dir,
+            cc_home=args.cc_home,
             apply=args.apply,
             runner=_run_command if args.apply else None,
         )
     print(
-        f"changed={str(report.changed).lower()} plist={report.plist_path}"
+        f"changed={str(report.changed).lower()}"
+        f" cc_settings_changed={str(report.cc_settings_changed).lower()}"
+        f" plist={report.plist_path}"
     )
     return 0
 

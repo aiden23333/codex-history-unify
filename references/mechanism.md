@@ -60,5 +60,5 @@ is installed, and use `scripts/sync_provider.py` as a standalone fallback.
   the sync script expects.
 - `pathlib` normalizes Windows paths, and the scripts use only Python standard
   library APIs, so no macOS-specific code is required.
-- `enable_ccswitch_unify.py` checks `~/.cc-switch/settings.json` and the
-  `%APPDATA%` locations used by Windows builds of CC Switch.
+- `install_switch_guard.py` is macOS-only; on Windows enable CC Switch's
+  unified Codex history toggle in its own settings UI instead.
