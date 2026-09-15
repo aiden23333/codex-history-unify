@@ -54,6 +54,9 @@ What the guard does on every detected switch:
   within the last three minutes and no task is mid-turn. A long-running session
   is never interrupted; pending repairs are applied the next time Codex closes.
 - Skips rollouts a live writer holds and never touches archived conversations.
+- Re-checks on every trigger instead of trusting the last successful switch, so
+  damage written later under the same provider is still repaired once Codex
+  closes.
 - Retries a repair that another process blocks with backoff (20 s up to 300 s)
   instead of looping or reporting success it did not achieve; a repair blocked
   while Codex runs is retried as soon as the app closes.
@@ -84,13 +87,16 @@ manual migration when the guard is unavailable or a conversation still fails:
 
 1. Read the complete first API error and identify the target provider.
 2. Run `python3 scripts/migrate_protocol.py --target auto --dry-run`.
-3. For a GPT target, report the affected file and item counts, then run
+3. Report the affected file and item counts, then run
    `python3 scripts/migrate_protocol.py --target gpt --apply`. This performs
-   the three verified repairs in one pass:
+   the verified repairs in one pass:
    - normalize non-`msg*` assistant response IDs and linked UI event IDs;
    - remove DeepSeek plaintext reasoning response items;
    - remove `rs_resp_*` reasoning references lacking encrypted payloads,
-     which cannot be replayed after `store=false`.
+     which cannot be replayed after `store=false`;
+   - remove tool-call items that carry no `call_id` (notifications such as
+     `send_message_to_thread` or automation heartbeats written without one),
+     which DeepSeek rejects with `input: missing field 'call_id'`.
 4. Restart Codex before retrying the old conversation.
 5. For a DeepSeek target, the script is diagnostic-only. Do not reverse the
    GPT cleanup mechanically; inspect the first real CC Switch/DeepSeek error
