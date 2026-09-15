@@ -385,9 +385,11 @@ def run_forever(
 ) -> None:
     """Watch for switch-state changes and finish deferred repairs off-peak.
 
-    A repair that Codex currently blocks (mid-turn writes) is retried with
-    exponential backoff instead of being abandoned, so the next launch is still
-    healthy without the user running anything by hand.
+    A repair blocked while Codex runs is retried when the app closes (the app
+    state transition is watched directly). A repair blocked by something else
+    (a rollout another process still holds) is retried with exponential backoff
+    instead of being abandoned, so the next launch is still healthy without the
+    user running anything by hand.
     """
 
     previous = None
@@ -434,7 +436,7 @@ def run_forever(
                     f"action={decision.action} fingerprint={decision.fingerprint[:12]}{detail}",
                     flush=True,
                 )
-                if decision.action.startswith("deferred"):
+                if decision.action.startswith("deferred") and not app_running:
                     pending_delay = min(
                         (pending_delay or pending_poll_seconds / 2) * 2,
                         max_pending_poll_seconds,

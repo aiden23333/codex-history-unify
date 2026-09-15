@@ -59,8 +59,9 @@ What the guard does on every detected switch:
   within the last three minutes and no task is mid-turn. A long-running session
   is never interrupted; pending repairs are applied the next time Codex closes.
 - Skips rollouts a live writer holds and never touches archived conversations.
-- Retries a blocked repair with backoff (20 s up to 300 s) instead of looping or
-  reporting success it did not achieve.
+- Retries a repair that another process blocks with backoff (20 s up to 300 s)
+  instead of looping or reporting success it did not achieve; a repair blocked
+  while Codex runs is retried as soon as the app closes.
 
 Keep the DeepSeek provider card on native Responses. A Chat Completions
 upstream converts Codex `function_call` history into paired chat messages and
