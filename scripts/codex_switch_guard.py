@@ -33,7 +33,7 @@ class ProcessProbe(Protocol):
     def codex_app_running(self) -> bool: ...
     def codex_app_uptime_seconds(self) -> float | None: ...
     def codex_rollouts_open(self) -> bool: ...
-    def rollout_locks_held(self) -> int: ...
+    def rollout_lock_signature(self) -> tuple[str, ...]: ...
 
 
 class AppController(Protocol):
@@ -107,26 +107,35 @@ class CodexProcessProbe:
         )
         return result.returncode == 0 and bool(result.stdout.strip())
 
-    def rollout_locks_held(self) -> int:
-        """How many processes currently hold a thread writer lock.
+    def rollout_lock_signature(self) -> tuple[str, ...]:
+        """Which thread writer locks are currently held.
 
         While Codex runs, a deferred repair can only make progress when a writer
-        releases one of these locks, so this cheap count gates the retry.
+        releases one of these locks. Tracking paths instead of process IDs is
+        essential because one app-server process can own many window locks.
         """
 
         lock_dir = self.codex_home / "thread-writer-locks"
         if not lock_dir.is_dir():
-            return 0
+            return ()
         locks = sorted(lock_dir.glob("*.lock"))[:64]
         if not locks:
-            return 0
+            return ()
         result = subprocess.run(
-            ["/usr/sbin/lsof", "-t", *[str(path) for path in locks]],
+            ["/usr/sbin/lsof", "-Fn", *[str(path) for path in locks]],
             capture_output=True,
             text=True,
             check=False,
         )
-        return len({line.strip() for line in result.stdout.splitlines() if line.strip()})
+        return tuple(
+            sorted(
+                {
+                    line[1:]
+                    for line in result.stdout.splitlines()
+                    if line.startswith("n") and line[1:]
+                }
+            )
+        )
 
 
 LsofProcessProbe = CodexProcessProbe
@@ -463,7 +472,7 @@ def run_forever(
     logged_error = None
     pending = False
     backoff = pending_poll_seconds
-    held_locks = 0
+    held_locks: tuple[str, ...] = ()
     last_attempt = 0.0
     app_running: bool | None = None
     app_polled_at = 0.0
@@ -489,8 +498,8 @@ def run_forever(
             if app_running:
                 if now - lock_polled_at >= lock_poll_seconds:
                     lock_polled_at = now
-                    held_now = guard.process_probe.rollout_locks_held()
-                    retry_ready = held_now < held_locks
+                    held_now = guard.process_probe.rollout_lock_signature()
+                    retry_ready = bool(set(held_locks) - set(held_now))
                     held_locks = held_now
             elif now - last_attempt >= backoff:
                 retry_ready = True
@@ -528,7 +537,7 @@ def run_forever(
                 if decision.action.startswith("deferred"):
                     pending = True
                     if app_running:
-                        held_locks = guard.process_probe.rollout_locks_held()
+                        held_locks = guard.process_probe.rollout_lock_signature()
                         lock_polled_at = time.monotonic()
                     else:
                         backoff = min(

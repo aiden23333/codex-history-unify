@@ -4,8 +4,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "migrate_protocol.py"
@@ -295,6 +297,37 @@ class ScanCacheTest(unittest.TestCase):
         cache = migrate_protocol.ScanCache(self.cache_path, "deepseek")
         migrate_protocol.plan(self.sessions, self.locks, "deepseek", lsof, cache=cache)
         self.assertEqual(cache.entries, {})
+
+    def test_concurrent_saves_do_not_share_a_temporary_file(self) -> None:
+        from scripts import migrate_protocol
+
+        caches = [migrate_protocol.ScanCache(self.cache_path, "deepseek") for _ in range(2)]
+        for cache in caches:
+            cache.mark_clean(self.rollout, migrate_protocol._signature(self.rollout))
+
+        barrier = threading.Barrier(2)
+        real_replace = os.replace
+        errors: list[Exception] = []
+
+        def synchronized_replace(source, destination):
+            barrier.wait(timeout=2)
+            real_replace(source, destination)
+
+        def save(cache) -> None:
+            try:
+                cache.save()
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch("scripts.migrate_protocol.os.replace", side_effect=synchronized_replace):
+            threads = [threading.Thread(target=save, args=(cache,)) for cache in caches]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(self.cache_path.exists())
 
 
 class OrphanToolItemTest(unittest.TestCase):

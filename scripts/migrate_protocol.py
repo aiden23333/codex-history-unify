@@ -346,9 +346,20 @@ class ScanCache:
             "rules": SCAN_RULES_VERSION,
             "clean": {key: list(value) for key, value in sorted(self.entries.items())},
         }
-        temp = self.path.with_name(self.path.name + ".tmp")
-        temp.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(temp, self.path)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=self.path.parent,
+            prefix=self.path.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            json.dump(payload, fh)
+            temp = Path(fh.name)
+        try:
+            os.replace(temp, self.path)
+        finally:
+            temp.unlink(missing_ok=True)
         self.dirty = False
 
 

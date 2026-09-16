@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.codex_switch_guard import (
     CodexProcessProbe,
@@ -396,9 +397,11 @@ class ForeverLoopTest(unittest.TestCase):
             def codex_app_running(self) -> bool:
                 return True
 
-            def rollout_locks_held(self) -> int:
+            def rollout_lock_signature(self) -> tuple[str, ...]:
                 self.lock_polls += 1
-                return 2 if self.lock_polls <= 1 else 1
+                if self.lock_polls <= 1:
+                    return ("thread-a.lock", "thread-b.lock")
+                return ("thread-b.lock",)
 
         class FakeGuard:
             codex_home = Path("/tmp/codex-home")
@@ -442,8 +445,8 @@ class ForeverLoopTest(unittest.TestCase):
                     raise KeyboardInterrupt
                 return True
 
-            def rollout_locks_held(self) -> int:
-                return 3
+            def rollout_lock_signature(self) -> tuple[str, ...]:
+                return ("thread-a.lock", "thread-b.lock", "thread-c.lock")
 
         class FakeGuard:
             codex_home = Path("/tmp/codex-home")
@@ -471,6 +474,51 @@ class ForeverLoopTest(unittest.TestCase):
         # One attempt at startup; the lock count never drops, so nothing repeats.
         self.assertEqual(len(calls), 1)
 
+    def test_replaced_writer_lock_triggers_another_attempt(self) -> None:
+        """A closed window is detected even when another opens immediately."""
+
+        calls: list[str] = []
+
+        class Probe:
+            def __init__(self) -> None:
+                self.lock_polls = 0
+
+            def codex_app_running(self) -> bool:
+                return True
+
+            def rollout_lock_signature(self) -> tuple[str, ...]:
+                self.lock_polls += 1
+                if self.lock_polls <= 1:
+                    return ("thread-a.lock",)
+                return ("thread-b.lock",)
+
+        class FakeGuard:
+            codex_home = Path("/tmp/codex-home")
+            cc_home = Path("/tmp/cc-home")
+            process_probe = Probe()
+
+            @staticmethod
+            def run_once():
+                calls.append("run")
+                if len(calls) > 1:
+                    raise KeyboardInterrupt
+                return type(
+                    "D",
+                    (),
+                    {"action": "deferred", "fingerprint": "f" * 8, "unreadable": 0},
+                )()
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_forever(
+                FakeGuard(),
+                poll_seconds=0.01,
+                pending_poll_seconds=0.01,
+                max_pending_poll_seconds=0.02,
+                app_poll_seconds=0.01,
+                lock_poll_seconds=0.01,
+            )
+        self.assertEqual(len(calls), 2)
+
 
 class ElapsedParseTest(unittest.TestCase):
     def test_parses_ps_etime_formats(self) -> None:
@@ -485,6 +533,27 @@ class ElapsedParseTest(unittest.TestCase):
         probe = CodexProcessProbe(Path.home() / ".codex")
         uptime = probe.codex_app_uptime_seconds()
         self.assertTrue(uptime is None or uptime >= 0)
+
+    def test_lock_signature_reports_lock_paths_not_process_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            lock_dir = root / "thread-writer-locks"
+            lock_dir.mkdir()
+            first = lock_dir / "thread-a.lock"
+            second = lock_dir / "thread-b.lock"
+            first.touch()
+            second.touch()
+            completed = type(
+                "Result",
+                (),
+                {
+                    "stdout": f"p123\nn{first}\nn{second}\n",
+                    "returncode": 0,
+                },
+            )()
+            with patch("scripts.codex_switch_guard.subprocess.run", return_value=completed):
+                signature = CodexProcessProbe(root).rollout_lock_signature()
+            self.assertEqual(signature, (str(first), str(second)))
 
     def test_log_timestamp_is_sortable(self) -> None:
         self.assertRegex(_stamp(), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
